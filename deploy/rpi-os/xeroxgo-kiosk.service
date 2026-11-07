@@ -1,0 +1,55 @@
+# XeroxGo Kiosk Spooler & HDMI Display Daemon systemd Unit
+#
+# Configured for Raspberry Pi OS framebuffer (/dev/fb0) with full
+# terminal cursor suppression and display isolation.
+
+[Unit]
+Description=XeroxGo Kiosk Spooler & HDMI Display Daemon
+Documentation=https://github.com/Shaabas/XeroxGo
+After=network-online.target
+Wants=network-online.target
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+
+User=xg1
+Group=xg1
+SupplementaryGroups=video lp input tty
+
+# Prevent TTY reset / disallocation that causes screen blanking and flicker
+TTYPath=/dev/tty1
+TTYReset=no
+TTYVHangup=no
+TTYVTDisallocate=no
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+# Seamless handover: dismiss Plymouth bootsplash so kiosk daemon can access fb0
+ExecStartPre=-/usr/bin/plymouth --quit
+
+EnvironmentFile=-/etc/default/xeroxgo-kiosk
+
+ExecStart=/home/xg1/xeroxgo-kiosk \
+  --cloud-url=${XEROXGO_CLOUD_WS_URL} \
+  --kiosk-id=${XEROXGO_KIOSK_ID} \
+  --cups-printer=${XEROXGO_CUPS_PRINTER} \
+  --printer-model="${XEROXGO_PRINTER_MODEL}" \
+  --state-db=/var/kiosk/state.db \
+  --download-dir=/var/kiosk/jobs \
+  --framebuffer=/dev/fb0 \
+  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT}
+
+# Security hardening and device access
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/kiosk /dev/fb0 /dev/tty1
+DeviceAllow=/dev/fb0 rw
+DeviceAllow=/dev/tty1 rw
+
+[Install]
+WantedBy=multi-user.target

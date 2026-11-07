@@ -1,0 +1,35 @@
+services:
+  - type: web
+    runtime: docker
+    name: xeroxgo-cloud
+    plan: 1c-2g
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    autoDeployTrigger: checksPass
+    disk:
+      name: xeroxgo-data
+      mountPath: /data
+      sizeGB: 10
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: XEROXGO_DEV_MODE
+        value: "0"
+      - key: XEROXGO_JOBS_DIR
+        value: /data/jobs
+      - key: XEROXGO_PUBLIC_URL
+        value: https://xeroxgo-cloud.onrender.com
+      - key: XEROXGO_PRICE_PER_SHEET_PAISE
+        value: "200"
+      - key: XEROXGO_DOWNLOAD_SECRET
+        generateValue: true
+      - key: XEROXGO_WEBHOOK_SECRET
+        generateValue: true
+      - key: XEROXGO_ADMIN_USER
+        sync: false
+      - key: XEROXGO_ADMIN_PASSWORD
+        sync: false
+      - key: XEROXGO_ALLOWED_ORIGINS
+        sync: false

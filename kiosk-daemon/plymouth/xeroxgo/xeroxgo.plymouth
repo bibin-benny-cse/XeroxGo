@@ -1,0 +1,9 @@
+[Plymouth Theme]
+Name=XeroxGo
+Description=XeroxGo Kiosk Silent Boot Splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/xeroxgo
+ScriptFile=/usr/share/plymouth/themes/xeroxgo/xeroxgo.script
+

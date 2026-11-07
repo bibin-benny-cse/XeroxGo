@@ -1,0 +1,7 @@
+go 1.26.9
+
+use (
+	./cloud-backend
+	./kiosk-daemon
+	./pkg/contracts
+)

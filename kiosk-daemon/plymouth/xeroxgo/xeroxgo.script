@@ -1,0 +1,114 @@
+# XeroxGo Kiosk Plymouth Script
+# Minimalist, silent boot splash (Android-style centered logo with slow shimmer text effect)
+
+# 1. Solid pure black background (no gradients, no borders)
+Window.SetBackgroundTopColor(0.0, 0.0, 0.0);
+Window.SetBackgroundBottomColor(0.0, 0.0, 0.0);
+
+# 2. Query display geometry
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+
+# 3. Load XeroxGo brand logo and shimmer animation frames
+total_shimmer_frames = 36;
+
+i = 0;
+while (i < total_shimmer_frames) {
+    shimmer_images[i] = Image("shimmer-" + i + ".png");
+    i = i + 1;
+}
+
+base_logo = shimmer_images[0];
+orig_width = base_logo.GetWidth();
+orig_height = base_logo.GetHeight();
+
+# 4. Compute proportional dimensions for display (target ~35% of display width)
+target_width = screen_width * 0.35;
+if (target_width > 680) target_width = 680;
+if (target_width < 340) target_width = 340;
+
+aspect = orig_height / orig_width;
+target_height = target_width * aspect;
+
+# Scale if significantly different from baseline, otherwise render 1:1
+should_scale = (Math.Abs(orig_width - target_width) > 16);
+if (should_scale) {
+    i = 0;
+    while (i < total_shimmer_frames) {
+        active_frames[i] = shimmer_images[i].Scale(target_width, target_height);
+        i = i + 1;
+    }
+} else {
+    i = 0;
+    while (i < total_shimmer_frames) {
+        active_frames[i] = shimmer_images[i];
+        i = i + 1;
+    }
+    target_width = orig_width;
+    target_height = orig_height;
+}
+
+# 5. Position sprite directly at screen center
+logo_sprite = Sprite(active_frames[0]);
+logo_x = (screen_width / 2) - (target_width / 2);
+logo_y = (screen_height / 2) - (target_height / 2);
+
+logo_sprite.SetX(logo_x);
+logo_sprite.SetY(logo_y);
+logo_sprite.SetZ(10);
+
+# 6. Smooth Android-style fade-in and slow shimmer loop
+opacity = 0.0;
+logo_sprite.SetOpacity(opacity);
+
+# State variables
+faded_in = 0;
+shimmer_tick = 0;
+
+# Timing parameters:
+# At ~50-60 Hz refresh rate:
+# 36 frames * 2 ticks = 72 ticks (~1.3s smooth sweep across logo text)
+# + 60 ticks (~1.1s calm resting pause on standard logo)
+# Total cycle: ~2.4 seconds per shimmer loop
+sweep_ticks = total_shimmer_frames * 2;
+cycle_ticks = sweep_ticks + 60;
+
+fun refresh_callback () {
+    # Phase 1: Smooth fade-in on initial boot
+    if (faded_in == 0) {
+        opacity = opacity + 0.04;
+        if (opacity >= 1.0) {
+            opacity = 1.0;
+            faded_in = 1;
+        }
+        logo_sprite.SetOpacity(opacity);
+        return;
+    }
+
+    # Phase 2: Slow shimmer effect across logo text
+    shimmer_tick = shimmer_tick + 1;
+    if (shimmer_tick < sweep_ticks) {
+        frame_idx = Math.Int(shimmer_tick / 2);
+        if (frame_idx >= total_shimmer_frames) frame_idx = total_shimmer_frames - 1;
+        logo_sprite.SetImage(active_frames[frame_idx]);
+    } else {
+        # Rest on base logo during calm pause
+        logo_sprite.SetImage(active_frames[0]);
+        if (shimmer_tick >= cycle_ticks) {
+            shimmer_tick = 0;
+        }
+    }
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# 7. Clean handover to kiosk daemon (retain frame so there is zero black gap)
+fun quit_callback () {
+    # Keep logo visible during handover so kiosk overwrites the framebuffer with zero flicker
+}
+Plymouth.SetQuitFunction(quit_callback);
+
+# 8. Suppress all console / system messages so screen remains 100% clean
+fun message_callback (text) {
+    # Intentionally empty: suppress all text and system messages
+}
+Plymouth.SetMessageFunction(message_callback);

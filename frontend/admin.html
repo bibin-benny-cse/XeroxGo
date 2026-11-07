@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XeroxGO - Admin Dashboard</title>
+  <meta name="description" content="XeroxGO Admin Dashboard - Real-time management and kiosk synchronization." />
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png" />
+  <link rel="stylesheet" href="/css/admin.css?v=5" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+  <!-- Initial Application Loader (Initialization Gate to prevent FOUC / flash of login on refresh) -->
+  <div id="app-loader" class="app-loader-container">
+    <div style="display:flex; flex-direction:column; align-items:center; gap:1rem;">
+      <img src="/assets/xeroxgo-full-logo-transparent.png" alt="XeroxGO" style="height:36px; width:auto; opacity:0.9;" />
+      <div class="spinner"></div>
+    </div>
+  </div>
+
+  <!-- Full-Page Authentication View (Default hidden; revealed strictly when unauthenticated) -->
+  <div id="auth-page" class="auth-page-container hidden">
+    <div class="auth-card">
+      <div class="auth-header">
+        <img src="/assets/xeroxgo-full-logo-transparent.png" alt="XeroxGO" class="auth-logo" />
+        <h1 class="auth-title">Admin Sign In</h1>
+      </div>
+
+      <form id="login-form" class="auth-form" autocomplete="on">
+        <div id="login-error" class="auth-error-box hidden" role="alert"></div>
+
+        <div class="form-group">
+          <label class="form-label" for="login-username">Username</label>
+          <input id="login-username" class="form-input" type="text" placeholder="Username" required autocomplete="username" autofocus />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="login-password">Password</label>
+          <input id="login-password" class="form-input" type="password" placeholder="••••••••" required autocomplete="current-password" />
+        </div>
+
+        <button id="login-submit-btn" class="btn-primary auth-submit-btn" type="submit">
+          Sign In
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Authenticated Dashboard Template (Mounted strictly upon verified authentication) -->
+  <template id="dashboard-template">
+    <!-- Top Navigation -->
+    <nav class="admin-navbar">
+      <div class="navbar-inner">
+        <div class="nav-brand">
+          <img src="/assets/xeroxgo-full-logo-transparent.png" alt="XeroxGO" />
+        </div>
+        <div class="nav-actions">
+          <div id="user-info" style="font-size:0.875rem; font-weight:600; color:var(--text-muted); display:flex; align-items:center; gap:0.5rem;">
+            <span id="user-name">admin</span>
+          </div>
+          <button id="change-password-nav-btn" class="btn-secondary" style="font-size:0.8125rem; padding:0.4rem 0.75rem;" type="button">Change Password</button>
+          <button id="logout-btn" class="btn-logout" type="button">Sign Out</button>
+        </div>
+      </div>
+      <!-- Tab Navigation -->
+      <div class="nav-tabs-bar">
+        <button id="tab-nav-overview" class="nav-tab-item active" type="button">Overview</button>
+        <button id="tab-nav-orders" class="nav-tab-item" type="button">Orders</button>
+        <button id="tab-nav-pricing" class="nav-tab-item" type="button">Pricing</button>
+        <button id="tab-nav-ads" class="nav-tab-item" type="button">Ads</button>
+      </div>
+    </nav>
+
+    <!-- Main Container -->
+    <main class="admin-container">
+
+      <!-- 1. OVERVIEW VIEW -->
+      <section id="view-overview" class="admin-view">
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-title">Gross Revenue</div>
+            <div id="kpi-revenue" class="kpi-value">₹0.00</div>
+            <div class="kpi-subtext"><span id="kpi-revenue-today">₹0.00 today</span> · <span id="kpi-revenue-7d">₹0.00 this week</span></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">Print Volume</div>
+            <div id="kpi-sheets" class="kpi-value">0 sheets</div>
+            <div class="kpi-subtext"><span id="kpi-bw-orders">0 B&amp;W</span> · <span id="kpi-color-orders">0 Color</span></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">Completed Jobs</div>
+            <div id="kpi-completed" class="kpi-value">0</div>
+            <div class="kpi-subtext"><span id="kpi-total-orders">0 total attempts</span></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">Success Rate</div>
+            <div id="kpi-success-rate" class="kpi-value">100%</div>
+            <div class="kpi-subtext"><span id="kpi-aov">Avg ₹0.00 / order</span></div>
+          </div>
+        </div>
+
+        <!-- Trend Chart Card -->
+        <div class="chart-card">
+          <div class="chart-header">
+            <div>
+              <h2 class="panel-title">Daily Volume &amp; Revenue</h2>
+            </div>
+            <div style="font-size:0.8125rem; color:var(--text-muted); font-weight:600;">Past 7 Days</div>
+          </div>
+          <div id="analytics-chart-container" class="chart-container-box">
+            <!-- Rendered via SVG -->
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. ORDERS VIEW -->
+      <section id="view-orders" class="admin-view hidden">
+        <div class="panel-card">
+          <div class="table-toolbar">
+            <div style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:center;">
+              <input id="orders-search-input" class="table-search-input" type="text" placeholder="Filter by ID, Code..." />
+              <select id="orders-status-filter" class="form-input" style="width:auto; padding:0.55rem 0.85rem;">
+                <option value="">All Statuses</option>
+                <option value="COMPLETED">Completed</option>
+                <option value="PRINTING">Printing</option>
+                <option value="FAILED_REFUNDABLE">Failed / Refundable</option>
+                <option value="PAUSED_ERROR">Paused Error</option>
+                <option value="PENDING_PAYMENT">Pending Payment</option>
+              </select>
+            </div>
+            <div style="display:flex; gap:0.5rem;">
+              <button id="orders-refresh-btn" class="btn-secondary" type="button" style="padding:0.55rem 0.85rem; font-size:0.875rem;">
+                Refresh
+              </button>
+              <button id="orders-export-btn" class="btn-primary" type="button" style="padding:0.55rem 0.85rem; font-size:0.875rem;">
+                Export CSV
+              </button>
+            </div>
+          </div>
+
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Code</th>
+                  <th>Date</th>
+                  <th>Mode</th>
+                  <th>Pages / Sheets</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th style="text-align:right;">Action</th>
+                </tr>
+              </thead>
+              <tbody id="orders-table-body">
+                <tr><td colspan="8" style="text-align:center; padding:2rem; color:var(--text-muted);">Loading orders...</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Pagination -->
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:1rem; padding:0 0.5rem;">
+            <div id="orders-count-text" style="font-size:0.8125rem; color:var(--text-muted);">Showing 0 orders</div>
+            <div style="display:flex; gap:0.5rem;">
+              <button id="orders-prev-btn" class="btn-secondary" type="button" style="padding:0.4rem 0.75rem; font-size:0.8rem;" disabled>Previous</button>
+              <button id="orders-next-btn" class="btn-secondary" type="button" style="padding:0.4rem 0.75rem; font-size:0.8rem;" disabled>Next</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. PRICING VIEW -->
+      <section id="view-pricing" class="admin-view hidden">
+        <div class="pricing-grid">
+          
+          <!-- Pricing Editor Card -->
+          <div class="panel-card">
+            <div class="panel-header" style="margin-bottom:1.5rem;">
+              <div>
+                <h2 class="panel-title">Print Rates</h2>
+              </div>
+            </div>
+
+            <form id="pricing-form">
+              <!-- Black & White Section -->
+              <div style="font-size:0.8125rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted); margin-bottom:0.75rem;">
+                Black &amp; White (Monochrome)
+              </div>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem;">
+                <div class="form-group">
+                  <label class="form-label" for="price-bw-simplex-input">B&amp;W Single Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-bw-simplex-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed page.</div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="price-bw-duplex-input">B&amp;W Double Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-bw-duplex-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed side.</div>
+                </div>
+              </div>
+
+              <!-- Color Section -->
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; padding-top:1rem; border-top:1px solid var(--border);">
+                <div style="font-size:0.8125rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);">
+                  Color Printing
+                </div>
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <span style="font-size:0.75rem; color:var(--text-muted);">Enable Kiosk Color</span>
+                  <label class="switch">
+                    <input type="checkbox" id="pricing-color-enabled-toggle" />
+                    <span class="slider"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div id="pricing-hardware-notice" style="font-size:0.75rem; color:var(--text-muted); background:var(--bg-slate); padding:0.6rem 0.85rem; border-radius:var(--radius-sm); margin-bottom:1rem; border:1px solid var(--border);">
+                <strong>Kiosk Status:</strong> Production printer is Monochrome Laser. When disabled, mobile web orders are locked to B&amp;W.
+              </div>
+
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem;">
+                <div class="form-group">
+                  <label class="form-label" for="price-color-simplex-input">Color Single Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-color-simplex-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed page.</div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="price-color-duplex-input">Color Double Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-color-duplex-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed side.</div>
+                </div>
+              </div>
+
+              <div style="margin-top:1.5rem;">
+                <button id="pricing-save-btn" class="btn-primary" type="submit" style="width:100%;">
+                  Save Rates
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Live Cost Estimator -->
+          <div class="panel-card">
+            <div class="panel-header" style="margin-bottom:1.5rem;">
+              <div>
+                <h2 class="panel-title">Cost Estimator</h2>
+              </div>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:1rem;">
+              <div class="form-group">
+                <label class="form-label" for="calc-pages-input">Document Pages</label>
+                <input id="calc-pages-input" class="form-input" type="number" min="1" max="500" value="10" />
+              </div>
+
+              <div class="form-group">
+                <label class="form-label">Sides</label>
+                <div style="display:flex; gap:0.75rem;">
+                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
+                    <input type="radio" name="calc-duplex" value="simplex" checked />
+                    <span style="font-weight:600; font-size:0.875rem;">Single Side</span>
+                  </label>
+                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
+                    <input type="radio" name="calc-duplex" value="duplex" />
+                    <span style="font-weight:600; font-size:0.875rem;">Double Side</span>
+                  </label>
+                </div>
+              </div>
+
+              <div style="margin-top:1rem; padding:1.25rem; background:#F8FAFC; border:1px solid var(--border); border-radius:var(--radius-sm);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Physical Sheets:</span>
+                  <span id="calc-result-sheets" style="font-weight:700;">10 sheets</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Monochrome:</span>
+                  <span id="calc-result-bw" style="font-weight:800; font-size:1.15rem; color:var(--text-main);">₹20.00</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Color:</span>
+                  <span id="calc-result-color" style="font-weight:800; font-size:1.15rem; color:var(--primary);">₹100.00</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- 4. ADS VIEW -->
+      <section id="view-ads" class="admin-view hidden">
+        <div class="admin-grid">
+
+          <!-- Left Panel: Ad Management -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h1 class="panel-title">Promotional Ads</h1>
+              </div>
+              <button id="create-ad-btn" class="btn-primary" type="button">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                New Ad
+              </button>
+            </div>
+
+            <!-- Ad List -->
+            <div id="ad-list" class="ad-list">
+              <div style="text-align:center; padding:3rem 1rem; color:var(--text-muted);">
+                <div class="spinner" style="margin:0 auto 1rem;"></div>
+                Loading ads...
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Panel: Preview -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Preview</h2>
+              </div>
+            </div>
+
+            <!-- Preview Tabs -->
+            <div class="preview-tabs">
+              <button id="tab-mobile" class="preview-tab-btn active" type="button">Mobile Web</button>
+              <button id="tab-kiosk" class="preview-tab-btn" type="button">Kiosk Screen (16:9)</button>
+            </div>
+
+            <!-- Mobile Simulator -->
+            <div id="mobile-preview-container" class="mobile-preview-box">
+              <div class="mobile-notch"></div>
+              <div id="mobile-slide-preview" class="mobile-slide-card" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
+                <div id="mobile-preview-title" class="mobile-slide-title">Quick &amp; Easy</div>
+                <div id="mobile-preview-desc" class="mobile-slide-desc">Direct UPI payment. No coins, no cash needed.</div>
+              </div>
+              <div id="mobile-preview-dots" class="mobile-dots">
+                <span class="preview-dot active"></span>
+                <span class="preview-dot"></span>
+                <span class="preview-dot"></span>
+              </div>
+            </div>
+
+            <!-- Kiosk Simulator -->
+            <div id="kiosk-preview-container" class="kiosk-preview-box hidden">
+              <div class="kiosk-preview-aspect">
+                <div id="kiosk-slide-preview" class="kiosk-preview-slide" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
+                  <div id="kiosk-preview-title" class="kiosk-slide-title">Quick &amp; Easy</div>
+                  <div id="kiosk-preview-desc" class="kiosk-slide-desc">Direct UPI payment. No coins, no cash needed.</div>
+                </div>
+                <div class="kiosk-preview-qr-card">
+                  <div class="qr-placeholder-box"></div>
+                  <div style="font-size:0.65rem; font-weight:800; color:#0F172A; line-height:1.2;">SCAN TO PRINT</div>
+                  <div style="font-size:0.55rem; color:#64748B;">xeroxgo.vercel.app</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Order Details Modal -->
+    <div id="order-modal" class="modal-overlay hidden">
+      <div class="modal-card" style="max-width:540px;">
+        <div class="panel-header" style="margin-bottom:1.25rem;">
+          <h2 class="panel-title">Order Details</h2>
+          <button id="order-modal-close-btn" class="btn-icon" type="button" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div id="order-modal-body" style="display:flex; flex-direction:column; gap:0.85rem; font-size:0.875rem;">
+          <!-- Dynamically populated -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Change Password Modal -->
+    <div id="password-modal" class="modal-overlay hidden">
+      <div class="modal-card" style="max-width:440px;">
+        <div class="panel-header" style="margin-bottom:1.25rem;">
+          <h2 class="panel-title">Change Password</h2>
+          <button id="password-modal-close-btn" class="btn-icon" type="button" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <form id="password-form">
+          <div id="password-modal-error" class="auth-error-box hidden" style="margin-bottom:1rem;" role="alert"></div>
+
+          <div class="form-group">
+            <label class="form-label" for="pwd-current">Current Password</label>
+            <input id="pwd-current" class="form-input" type="password" required autocomplete="current-password" placeholder="••••••••" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="pwd-new">New Password</label>
+            <input id="pwd-new" class="form-input" type="password" required minlength="8" autocomplete="new-password" placeholder="Min 8 characters" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="pwd-confirm">Confirm New Password</label>
+            <input id="pwd-confirm" class="form-input" type="password" required minlength="8" autocomplete="new-password" placeholder="Repeat new password" />
+          </div>
+
+          <div class="modal-actions" style="margin-top:1.5rem;">
+            <button id="password-modal-cancel-btn" class="btn-secondary" type="button">Cancel</button>
+            <button id="password-modal-submit-btn" class="btn-primary" type="submit">Update Password</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Ad Editor Modal -->
+    <div id="ad-modal" class="modal-overlay hidden">
+      <div class="modal-card">
+        <div class="panel-header" style="margin-bottom:1rem;">
+          <h2 id="modal-heading" class="panel-title">Edit Ad</h2>
+          <button id="modal-close-btn" class="btn-icon" type="button" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
+        <form id="ad-form">
+          <input type="hidden" id="ad-id" value="" />
+
+          <!-- Ad Type Selector -->
+          <div class="form-group">
+            <label class="form-label">Style</label>
+            <div style="display:flex; gap:0.75rem;">
+              <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
+                <input type="radio" name="ad-type" value="gradient" checked />
+                <span style="font-weight:600; font-size:0.875rem;">Gradient</span>
+              </label>
+              <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
+                <input type="radio" name="ad-type" value="image" />
+                <span style="font-weight:600; font-size:0.875rem;">Image</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Title & Description -->
+          <div class="form-group">
+            <label class="form-label" for="ad-title">Headline</label>
+            <input id="ad-title" class="form-input" type="text" placeholder="e.g. Quick & Easy" required maxlength="60" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="ad-desc">Subtitle</label>
+            <input id="ad-desc" class="form-input" type="text" placeholder="e.g. Direct UPI payment. No coins, no cash needed." required maxlength="120" />
+          </div>
+
+          <!-- Gradient Controls -->
+          <div id="gradient-controls-group" class="form-group">
+            <label class="form-label">Presets</label>
+            <div class="color-presets-row">
+              <button type="button" class="palette-btn" title="Royal Blue" style="background:linear-gradient(135deg, #1E3A8A, #2563EB, #4F46E5);" data-c0="#1E3A8A" data-c1="#2563EB" data-c2="#4F46E5"></button>
+              <button type="button" class="palette-btn" title="Emerald Mint" style="background:linear-gradient(135deg, #065F46, #10B981, #059669);" data-c0="#065F46" data-c1="#10B981" data-c2="#059669"></button>
+              <button type="button" class="palette-btn" title="Royal Violet" style="background:linear-gradient(135deg, #581C87, #7C3AED, #D97706);" data-c0="#581C87" data-c1="#7C3AED" data-c2="#D97706"></button>
+              <button type="button" class="palette-btn" title="Sunset Amber" style="background:linear-gradient(135deg, #7C2D12, #EA580C, #F59E0B);" data-c0="#7C2D12" data-c1="#EA580C" data-c2="#F59E0B"></button>
+              <button type="button" class="palette-btn" title="Midnight Slate" style="background:linear-gradient(135deg, #0F172A, #334155, #1E293B);" data-c0="#0F172A" data-c1="#334155" data-c2="#1E293B"></button>
+              <button type="button" class="palette-btn" title="Crimson Rose" style="background:linear-gradient(135deg, #881337, #E11D48, #FB7185);" data-c0="#881337" data-c1="#E11D48" data-c2="#FB7185"></button>
+            </div>
+
+            <label class="form-label" style="margin-top:0.75rem;">Colors</label>
+            <div class="gradient-inputs-grid">
+              <div>
+                <span style="font-size:0.75rem; color:var(--text-muted); display:block; margin-bottom:0.25rem;">Start</span>
+                <div style="display:flex; align-items:center; gap:0.35rem;">
+                  <input id="ad-c0" type="color" value="#1E3A8A" style="width:36px; height:36px; border:none; border-radius:4px; cursor:pointer;" />
+                  <input id="ad-c0-hex" class="form-input" type="text" value="#1E3A8A" maxlength="7" style="font-family:monospace; padding:0.4rem;" />
+                </div>
+              </div>
+              <div>
+                <span style="font-size:0.75rem; color:var(--text-muted); display:block; margin-bottom:0.25rem;">Mid</span>
+                <div style="display:flex; align-items:center; gap:0.35rem;">
+                  <input id="ad-c1" type="color" value="#2563EB" style="width:36px; height:36px; border:none; border-radius:4px; cursor:pointer;" />
+                  <input id="ad-c1-hex" class="form-input" type="text" value="#2563EB" maxlength="7" style="font-family:monospace; padding:0.4rem;" />
+                </div>
+              </div>
+              <div>
+                <span style="font-size:0.75rem; color:var(--text-muted); display:block; margin-bottom:0.25rem;">End</span>
+                <div style="display:flex; align-items:center; gap:0.35rem;">
+                  <input id="ad-c2" type="color" value="#4F46E5" style="width:36px; height:36px; border:none; border-radius:4px; cursor:pointer;" />
+                  <input id="ad-c2-hex" class="form-input" type="text" value="#4F46E5" maxlength="7" style="font-family:monospace; padding:0.4rem;" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Image Controls -->
+          <div id="image-controls-group" class="form-group hidden">
+            <label class="form-label">Banner Image</label>
+            <div style="display:flex; gap:1rem; align-items:center;">
+              <div id="image-preview-thumb" style="width:120px; height:70px; border-radius:8px; border:1px dashed var(--border); background:#F8FAFC; display:flex; align-items:center; justify-content:center; color:var(--text-muted); font-size:0.75rem; overflow:hidden; background-size:cover; background-position:center;">
+                No file
+              </div>
+              <div style="flex:1;">
+                <input type="file" id="ad-image-file" accept="image/png, image/jpeg, image/webp" style="display:none;" />
+                <button id="upload-image-btn" type="button" class="btn-secondary" style="font-size:0.8rem; padding:0.45rem 0.85rem;">
+                  Choose Graphic...
+                </button>
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">
+                  PNG, JPG, WebP up to 5MB
+                </div>
+              </div>
+            </div>
+            <input type="hidden" id="ad-image-url" value="" />
+          </div>
+
+          <!-- Target Link URL -->
+          <div class="form-group">
+            <label class="form-label" for="ad-link">Target URL (Optional)</label>
+            <input id="ad-link" class="form-input" type="url" placeholder="https://example.com/promo" />
+          </div>
+
+          <!-- Active Toggle -->
+          <div class="form-group" style="display:flex; align-items:center; justify-content:space-between; padding-top:0.5rem; border-top:1px solid var(--border);">
+            <div style="font-weight:600; font-size:0.9rem;">Active</div>
+            <label class="switch">
+              <input type="checkbox" id="ad-is-active" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- Modal Actions -->
+          <div class="modal-actions">
+            <button id="modal-cancel-btn" class="btn-secondary" type="button">Cancel</button>
+            <button id="modal-save-btn" class="btn-primary" type="submit">
+              Save
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast-banner hidden">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+      <span id="toast-message">Saved</span>
+    </div>
+  </template>
+
+  <script src="/js/admin.js?v=5"></script>
+</body>
+</html>
