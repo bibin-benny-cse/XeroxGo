@@ -3,7 +3,7 @@ services:
     runtime: docker
     name: xeroxgo-cloud
     plan: 1c-2g
-    region: frankfurt
+    region: singapore
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /healthz
