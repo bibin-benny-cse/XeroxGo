@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/api/:match*",
-      "destination": "https://xeroxgo-cloud.onrender.com/api/:match*"
+      "destination": "https://xeroxgo-7s6i.onrender.com/api/:match*"
     },
     {
       "source": "/admin",
@@ -23,7 +23,7 @@
     },
     {
       "source": "/healthz",
-      "destination": "https://xeroxgo-cloud.onrender.com/healthz"
+      "destination": "https://xeroxgo-7s6i.onrender.com/healthz"
     }
   ],
   "headers": [
@@ -75,7 +75,7 @@
         },
         {
           "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self' 'unsafe-inline' https://checkout.razorpay.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' https://xeroxgo-cloud.onrender.com https://lumberjack.razorpay.com; frame-src https://api.razorpay.com; object-src 'none'; base-uri 'self';"
+          "value": "default-src 'self'; script-src 'self' 'unsafe-inline' https://checkout.razorpay.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' https://xeroxgo-7s6i.onrender.com https://lumberjack.razorpay.com; frame-src https://api.razorpay.com; object-src 'none'; base-uri 'self';"
         }
       ]
     }
