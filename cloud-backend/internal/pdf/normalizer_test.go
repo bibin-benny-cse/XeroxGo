@@ -16,6 +16,10 @@ import (
 func generateThreePagePDF(t *testing.T, dir string) string {
 	t.Helper()
 
+	if _, err := exec.LookPath("gs"); err != nil {
+		t.Skip("ghostscript (gs) not found in PATH; skipping test")
+	}
+
 	psPath := filepath.Join(dir, "fixture_input.ps")
 	pdfPath := filepath.Join(dir, "fixture_input.pdf")
 
@@ -305,6 +309,11 @@ func TestNormalizeAndCount_RejectsInvalidArguments(t *testing.T) {
 
 func generateNPagePDF(t *testing.T, dir string, n int) string {
 	t.Helper()
+
+	if _, err := exec.LookPath("gs"); err != nil {
+		t.Skip("ghostscript (gs) not found in PATH; skipping test")
+	}
+
 	var sb strings.Builder
 	sb.WriteString("%!PS\n")
 	for i := 1; i <= n; i++ {

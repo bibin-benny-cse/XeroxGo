@@ -712,3 +712,121 @@ func TestRejectsInvalidInput(t *testing.T) {
 		})
 	}
 }
+
+func TestIsJobCompleted(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	// 1. Unknown job returns false
+	done, err := s.IsJobCompleted(ctx, "job-unknown")
+	if err != nil {
+		t.Fatalf("unexpected error for unknown job: %v", err)
+	}
+	if done {
+		t.Fatalf("expected job-unknown to not be completed")
+	}
+
+	// 2. Save active job (SPOOLING)
+	cmd := sampleCommand("job-101")
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	done, err = s.IsJobCompleted(ctx, "job-101")
+	if err != nil {
+		t.Fatalf("unexpected error for active job: %v", err)
+	}
+	if done {
+		t.Fatalf("expected active job to not be completed")
+	}
+
+	// 3. Mark COMPLETED
+	evt := contracts.JobProgressEvent{
+		JobID:         "job-101",
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusCompleted,
+		PagesPrinted:  cmd.TotalPages,
+		SheetsPrinted: cmd.TotalSheets,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.UpdateProgress(ctx, evt); err != nil {
+		t.Fatalf("UpdateProgress failed: %v", err)
+	}
+
+	// 4. Verify IsJobCompleted is now true
+	done, err = s.IsJobCompleted(ctx, "job-101")
+	if err != nil {
+		t.Fatalf("unexpected error checking completed job: %v", err)
+	}
+	if !done {
+		t.Fatalf("expected job-101 to be completed")
+	}
+
+	// 5. Validation on empty/nil
+	if _, err := s.IsJobCompleted(nil, "job-101"); err == nil {
+		t.Fatalf("expected error on nil context")
+	}
+	if _, err := s.IsJobCompleted(ctx, ""); err == nil {
+		t.Fatalf("expected error on empty job_id")
+	}
+}
+
+func TestGetJob(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Non-existent job returns nil, nil
+	job, err := s.GetJob(ctx, "non-existent")
+	if err != nil {
+		t.Fatalf("unexpected error querying non-existent job: %v", err)
+	}
+	if job != nil {
+		t.Fatalf("expected nil job for non-existent job ID, got %+v", job)
+	}
+
+	// 2. Insert job and query it
+	cmd := sampleCommand("job-get-202")
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	job, err = s.GetJob(ctx, "job-get-202")
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if job == nil {
+		t.Fatalf("expected job to be found")
+	}
+	if job.Command.JobID != "job-get-202" {
+		t.Errorf("job ID = %s, want job-get-202", job.Command.JobID)
+	}
+	if job.Status != contracts.JobStatusSpooling {
+		t.Errorf("status = %s, want SPOOLING", job.Status)
+	}
+
+	// 3. Update progress and verify retrieved state reflects changes
+	evt := contracts.JobProgressEvent{
+		JobID:         "job-get-202",
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  3,
+		SheetsPrinted: 2,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.UpdateProgress(ctx, evt); err != nil {
+		t.Fatalf("UpdateProgress failed: %v", err)
+	}
+
+	updated, err := s.GetJob(ctx, "job-get-202")
+	if err != nil {
+		t.Fatalf("GetJob failed after update: %v", err)
+	}
+	if updated.Status != contracts.JobStatusPrinting {
+		t.Errorf("updated status = %s, want PRINTING", updated.Status)
+	}
+	if updated.PagesPrinted != 3 {
+		t.Errorf("updated pages_printed = %d, want 3", updated.PagesPrinted)
+	}
+}

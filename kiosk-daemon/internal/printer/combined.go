@@ -11,19 +11,19 @@ import (
 // CombineHealth merges CUPS queue availability with SNMP device health telemetry.
 //
 // Authoritative separation of responsibilities:
-// 1. CUPS is authoritative for queue status and active print job execution.
-//    If CUPS is actively PRINTING, the combined state remains PRINTING.
-// 2. SNMP is authoritative for physical hardware sensors:
-//    - TonerLevelPercent
-//    - DrumLifePercent
-//    - CoverOpen (door open)
-//    - PaperJam (jammed)
-//    - OutputBinFull (output tray full)
-//    - PaperTrayStatus (empty/low paper)
-// 3. If CUPS is online and SNMP is unreachable (network timeout / SNMP disabled),
-//    the printer remains online based on CUPS availability without disrupting the kiosk.
-// 4. If physical hardware faults (jam, door open, out of paper, bin full) occur,
-//    they are elevated to ErrorMessage and (when idle) transition the state to ERROR.
+//  1. CUPS is authoritative for queue status and active print job execution.
+//     If CUPS is actively PRINTING, the combined state remains PRINTING.
+//  2. SNMP is authoritative for physical hardware sensors:
+//     - TonerLevelPercent
+//     - DrumLifePercent
+//     - CoverOpen (door open)
+//     - PaperJam (jammed)
+//     - OutputBinFull (output tray full)
+//     - PaperTrayStatus (empty/low paper)
+//  3. If CUPS is online and SNMP is unreachable (network timeout / SNMP disabled),
+//     the printer remains online based on CUPS availability without disrupting the kiosk.
+//  4. If physical hardware faults (jam, door open, out of paper, bin full) occur,
+//     they are elevated to ErrorMessage and (when idle) transition the state to ERROR.
 func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.PrinterHealth) contracts.PrinterHealth {
 	now := time.Now().UTC()
 

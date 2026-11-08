@@ -20,11 +20,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"xeroxgo/cloud-backend/internal/payments"
 	"xeroxgo/cloud-backend/internal/pdf"
+	"xeroxgo/cloud-backend/internal/pins"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -34,20 +36,73 @@ import (
 var staticEmbedFS embed.FS
 
 type serverConfig struct {
-	addr               string
-	dbPath             string
-	jobsDir            string
-	pricePerSheetPaise int64
-	devMode            bool
-	downloadSecret     []byte
-	webhookSecret      []byte
+	addr                  string
+	dbPath                string
+	jobsDir               string
+	pricePerSheetPaise    int64
+	devMode               bool
+	downloadSecret        []byte
+	webhookSecret         []byte
+	pickupPINHMACSecret   []byte
+	maxActivePINsPerKiosk int
+	paymentSessionTTL     time.Duration
+	trustedProxies        []string
+	razorpayKeyID         string
+	razorpayKeySecret     string
+}
+
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLockEntry
+}
+
+type keyedLockEntry struct {
+	mu      sync.Mutex
+	waiters int
+}
+
+func newKeyedMutex() *keyedMutex {
+	return &keyedMutex{
+		locks: make(map[string]*keyedLockEntry),
+	}
+}
+
+func (km *keyedMutex) Lock(key string) func() {
+	if km == nil {
+		return func() {}
+	}
+	km.mu.Lock()
+	entry, ok := km.locks[key]
+	if !ok {
+		entry = &keyedLockEntry{}
+		km.locks[key] = entry
+	}
+	entry.waiters++
+	km.mu.Unlock()
+
+	entry.mu.Lock()
+
+	return func() {
+		entry.mu.Unlock()
+
+		km.mu.Lock()
+		entry.waiters--
+		if entry.waiters == 0 {
+			delete(km.locks, key)
+		}
+		km.mu.Unlock()
+	}
 }
 
 type appServer struct {
-	cfg      *serverConfig
-	db       *store.Store
-	hub      *ws.Hub
-	convWake chan struct{}
+	cfg            *serverConfig
+	db             *store.Store
+	hub            *ws.Hub
+	pinLimiter     *pins.RateLimiter
+	convWake       chan struct{}
+	razorpayClient payments.RazorpayClient
+	sessionLocks   *keyedMutex
+	webhookLocks   *keyedMutex
 }
 
 const portalHTML = `<!DOCTYPE html>
@@ -388,8 +443,11 @@ const portalHTML = `<!DOCTYPE html>
 
           <button id="btn-pay-upi" type="button" class="btn btn-primary" style="padding:0.85rem; font-size:0.95rem; font-weight:700; gap:0.5rem;">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-            Pay with UPI &amp; Print
+            Generate Pickup PIN
           </button>
+          <div style="font-size:0.8rem; color:var(--text-secondary); text-align:center; margin-top:-0.35rem;">
+            Pay with UPI directly on the physical kiosk screen when printing.
+          </div>
         </div>
         <div id="review-alert" class="alert alert-error hidden"></div>
       </div>
@@ -397,21 +455,37 @@ const portalHTML = `<!DOCTYPE html>
 
     <!-- 4. Live Print Status & Order Tracking Section -->
     <div id="status-section" class="hidden" style="margin-top:1.5rem; margin-bottom:2rem;">
-      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">Print Order Status</h2>
+      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">Print Order &amp; Pickup PIN</h2>
       <div class="card" style="margin-top:0; padding:1.25rem; display:flex; flex-direction:column; gap:1.25rem;">
-        <div>
-          <label style="display:block; margin-bottom:0.4rem; font-weight:600; font-size:0.85rem; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.5px;">
-            Your Kiosk Pickup Code
-          </label>
-          <div id="status-display-code" class="code-display">----</div>
-          <div style="font-size:0.8rem; color:var(--text-secondary); text-align:center; margin-top:0.35rem;">
-            Enter this 4-digit code on the kiosk screen if prompted.
+        <div class="order-meta-info">
+          <div>Order: <strong id="status-order-id" style="color:var(--text-primary); font-family:monospace;">-</strong></div>
+          <div>Machine: <strong id="status-kiosk-name" style="color:var(--text-primary);">-</strong></div>
+        </div>
+
+        <div class="pin-card-wrapper">
+          <div class="pin-label">Your 4-Digit Pickup PIN</div>
+          <div id="status-pickup-pin" class="pin-display-large">----</div>
+          <span id="status-display-code" class="hidden">----</span>
+
+          <div id="pin-timer-badge" class="pin-timer-badge">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <span id="pin-countdown-text">PIN valid for 15:00</span>
           </div>
+
+          <p class="pin-instruction-text">
+            Enter this 4-digit PIN on the <strong>kiosk touchscreen</strong> to view your order, scan the UPI QR code to pay, and start printing.
+          </p>
+
+          <button id="btn-refresh-pin" type="button" class="btn-refresh-pin">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+            <span>Refresh PIN</span>
+          </button>
+          <div id="pin-refresh-error" class="alert alert-error hidden" style="margin-top:0.25rem; width:100%; font-size:0.85rem;"></div>
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <span style="font-weight:600; color:var(--text-secondary); font-size:0.95rem;">Current Status</span>
-          <span id="status-badge" class="status-pill status-PENDING_PAYMENT">PENDING_PAYMENT</span>
+          <span id="status-badge" class="status-pill status-PENDING_PAYMENT">Pending Payment</span>
         </div>
 
         <div>
@@ -423,12 +497,6 @@ const portalHTML = `<!DOCTYPE html>
             <span>Sheets: <strong id="status-sheets-text" style="color:var(--text-primary);">0 / 0</strong></span>
           </div>
         </div>
-
-        {{if .DevMode}}
-        <button id="dev-simulate-payment-btn" type="button" class="btn btn-primary" style="background:#10B981; border:none; padding:0.75rem; font-weight:700;">
-          Simulate Payment (Dev Mode)
-        </button>
-        {{end}}
 
         <div id="status-success-alert" class="alert alert-success hidden" style="font-weight:600; text-align:center;">
           🎉 Print job completed! Please collect your document from the printer tray.
@@ -639,6 +707,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if ext == "" {
 		ext = ".pdf"
 	}
+	_ = os.MkdirAll(s.cfg.jobsDir, 0755)
 	tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "upload_in_*"+ext)
 	if err != nil {
 		http.Error(w, "failed to create temp file", http.StatusInternalServerError)
@@ -692,11 +761,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID := "job_" + jobHex
 
-	displayCode, err := randomDisplayCode()
+	orderSecret, orderSecretHash, err := pins.GenerateOrderOwnershipSecret()
 	if err != nil {
-		http.Error(w, "failed to generate display code", http.StatusInternalServerError)
+		http.Error(w, "failed to generate order ownership secret", http.StatusInternalServerError)
 		return
 	}
+	displayCode := "PIN-PROTECTED"
 
 	h := sha256.Sum256([]byte(orderID))
 	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
@@ -783,11 +853,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	order := store.Order{
-		OrderID:    orderID,
-		Command:    cmd,
-		Status:     contracts.JobStatusPendingPayment,
-		PricePaise: totalPricePaise,
-		ColorMode:  colorMode,
+		OrderID:         orderID,
+		Command:         cmd,
+		Status:          contracts.JobStatusPendingPayment,
+		PricePaise:      totalPricePaise,
+		ColorMode:       colorMode,
+		OrderSecretHash: orderSecretHash,
 	}
 
 	if err := s.db.CreateOrder(r.Context(), order); err != nil {
@@ -796,21 +867,100 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pinSecret := s.cfg.pickupPINHMACSecret
+	if len(pinSecret) < 32 {
+		pinSecret = []byte("dev_pickup_pin_hmac_secret_32_bytes_long_123")
+	}
+
+	maxActive := s.cfg.maxActivePINsPerKiosk
+	if maxActive <= 0 {
+		maxActive = 50
+	}
+
+	// Generate uniform 4-digit pickup PIN with collision retries
+	const maxPINRetries = 5
+	var (
+		pickupPIN    string
+		pinExpiresAt time.Time
+	)
+
+	for attempt := 0; attempt < maxPINRetries; attempt++ {
+		candidatePIN, err := pins.GenerateUniformPIN()
+		if err != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, "failed to generate pickup pin", http.StatusInternalServerError)
+			return
+		}
+
+		pinHMAC, err := pins.ComputePINHMAC(pinSecret, kioskID, candidatePIN)
+		if err != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, "failed to compute pickup pin hmac", http.StatusInternalServerError)
+			return
+		}
+
+		now := time.Now().UTC()
+		pinExpiresAt = now.Add(15 * time.Minute)
+		pinHex, err := randomHex(12)
+		if err != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, "failed to generate pin id", http.StatusInternalServerError)
+			return
+		}
+
+		pinRecord := store.PickupPIN{
+			ID:        "pin_" + pinHex,
+			OrderID:   orderID,
+			KioskID:   kioskID,
+			PINHMAC:   pinHMAC,
+			Status:    store.PickupPINActive,
+			CreatedAt: now,
+			ExpiresAt: pinExpiresAt,
+		}
+
+		err = s.db.CreatePickupPIN(r.Context(), pinRecord, maxActive)
+		if errors.Is(err, store.ErrPINCollision) {
+			continue // retry with a new uniform PIN
+		}
+		if errors.Is(err, store.ErrActivePINLimitExceeded) {
+			_ = os.Remove(outputPath)
+			http.Error(w, "maximum active pickup pins exceeded for kiosk, please try again shortly", http.StatusTooManyRequests)
+			return
+		}
+		if err != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, "failed to persist pickup pin", http.StatusInternalServerError)
+			return
+		}
+
+		pickupPIN = candidatePIN
+		break
+	}
+
+	if pickupPIN == "" {
+		_ = os.Remove(outputPath)
+		http.Error(w, "unable to allocate unique pickup pin after retries", http.StatusConflict)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"order_id":              orderID,
-		"job_id":                jobID,
-		"display_code":          displayCode,
-		"color_mode":            colorMode,
-		"total_pages":           normRes.TotalPages,
-		"total_sheets":          normRes.TotalSheets,
-		"copies":                copies,
-		"duplex":                string(duplexMode),
-		"price_per_sheet_paise": unitPrice,
-		"price_per_side_paise":  unitPrice,
-		"unit_price_paise":      unitPrice,
-		"total_price_paise":     totalPricePaise,
-		"status":                string(contracts.JobStatusPendingPayment),
+		"order_id":               orderID,
+		"job_id":                 jobID,
+		"pickup_pin":             pickupPIN,
+		"order_secret":           orderSecret,
+		"pin_expires_at":         pinExpiresAt.Unix(),
+		"pin_expires_in_seconds": int64(time.Until(pinExpiresAt).Seconds()),
+		"color_mode":             colorMode,
+		"total_pages":            normRes.TotalPages,
+		"total_sheets":           normRes.TotalSheets,
+		"copies":                 copies,
+		"duplex":                 string(duplexMode),
+		"price_per_sheet_paise":  unitPrice,
+		"price_per_side_paise":   unitPrice,
+		"unit_price_paise":       unitPrice,
+		"total_price_paise":      totalPricePaise,
+		"status":                 string(contracts.JobStatusPendingPayment),
 	})
 }
 
@@ -1072,101 +1222,6 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	const maxWebhookSize = 1024 * 1024 // 1 MiB
-	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookSize)
-	rawBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read webhook body", http.StatusBadRequest)
-		return
-	}
-
-	sig := r.Header.Get("X-Razorpay-Signature")
-	if sig == "" || !payments.VerifyWebhookSignature(rawBody, sig, string(s.cfg.webhookSecret)) {
-		http.Error(w, "invalid signature", http.StatusBadRequest)
-		return
-	}
-
-	var parsed struct {
-		Event   string `json:"event"`
-		Payload struct {
-			Payment struct {
-				Entity struct {
-					ID      string `json:"id"`
-					OrderID string `json:"order_id"`
-					Amount  int64  `json:"amount"`
-					Status  string `json:"status"`
-					Notes   struct {
-						OrderID string `json:"order_id"`
-					} `json:"notes"`
-				} `json:"entity"`
-			} `json:"payment"`
-		} `json:"payload"`
-	}
-
-	if err := json.Unmarshal(rawBody, &parsed); err != nil {
-		http.Error(w, "malformed webhook json", http.StatusBadRequest)
-		return
-	}
-
-	if parsed.Event != "payment.captured" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ignored"}`))
-		return
-	}
-
-	orderID := parsed.Payload.Payment.Entity.Notes.OrderID
-	if orderID == "" {
-		orderID = parsed.Payload.Payment.Entity.OrderID
-	}
-	if orderID == "" {
-		http.Error(w, "order id missing in payment entity", http.StatusBadRequest)
-		return
-	}
-
-	eventID := parsed.Payload.Payment.Entity.ID
-	if eventID == "" {
-		eventID = "evt_" + orderID
-	}
-
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusBadRequest)
-		return
-	}
-
-	// Requirement 10 & 19: Verify the actual Razorpay order amount equals the stored order amount in paise.
-	if parsed.Payload.Payment.Entity.Amount > 0 && parsed.Payload.Payment.Entity.Amount != order.PricePaise {
-		http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", order.PricePaise, parsed.Payload.Payment.Entity.Amount), http.StatusBadRequest)
-		return
-	}
-
-	recorded, err := s.db.RecordWebhook(r.Context(), eventID)
-	if err != nil {
-		http.Error(w, "failed to record webhook", http.StatusInternalServerError)
-		return
-	}
-	if !recorded {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"duplicate"}`))
-		return
-	}
-
-	_ = s.db.UpdateOrderStatus(r.Context(), orderID, contracts.JobStatusPaidWaiting)
-
-	if err := s.hub.SendJob(r.Context(), order.Command); err == nil {
-		_ = s.db.UpdateOrderStatus(r.Context(), orderID, contracts.JobStatusDispatched)
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
-}
-
 func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1216,7 +1271,6 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"order_id":       order.OrderID,
-		"display_code":   order.Command.DisplayCode,
 		"status":         currentStatus,
 		"total_pages":    order.Command.TotalPages,
 		"total_sheets":   order.Command.TotalSheets,
@@ -1233,9 +1287,13 @@ func main() {
 	addr := os.Getenv("XEROXGO_CLOUD_ADDR")
 	if addr == "" {
 		if p := os.Getenv("PORT"); p != "" {
-			addr = ":" + p
+			if strings.Contains(p, ":") {
+				addr = p
+			} else {
+				addr = "0.0.0.0:" + p
+			}
 		} else {
-			addr = ":8080"
+			addr = "0.0.0.0:10000"
 		}
 	}
 
@@ -1270,6 +1328,44 @@ func main() {
 		}
 	}
 
+	pickupPinSecretStr := os.Getenv("XEROXGO_PICKUP_PIN_HMAC_SECRET")
+	if !devMode {
+		if len(pickupPinSecretStr) < 32 {
+			log.Fatalf("Fatal: production mode requires non-empty XEROXGO_PICKUP_PIN_HMAC_SECRET of at least 32 characters")
+		}
+	} else {
+		if pickupPinSecretStr == "" {
+			pickupPinSecretStr = "dev_pickup_pin_hmac_secret_32_bytes_long_123"
+		} else if len(pickupPinSecretStr) < 32 {
+			log.Fatalf("XEROXGO_PICKUP_PIN_HMAC_SECRET must be at least 32 characters")
+		}
+	}
+
+	maxActivePINs := 50
+	if envMax := os.Getenv("XEROXGO_MAX_ACTIVE_PINS_PER_KIOSK"); envMax != "" {
+		if m, parseErr := strconv.Atoi(envMax); parseErr == nil && m > 0 {
+			maxActivePINs = m
+		}
+	}
+
+	paymentSessionTTL := 30 * time.Minute
+	if ttlEnv := os.Getenv("XEROXGO_PAYMENT_SESSION_TTL"); ttlEnv != "" {
+		if d, err := time.ParseDuration(ttlEnv); err == nil && d > 0 {
+			paymentSessionTTL = d
+		} else {
+			log.Printf("[WARN] invalid XEROXGO_PAYMENT_SESSION_TTL %q; defaulting to 30m", ttlEnv)
+		}
+	}
+
+	var trustedProxies []string
+	if tpEnv := os.Getenv("XEROXGO_TRUSTED_PROXIES"); tpEnv != "" {
+		for _, p := range strings.Split(tpEnv, ",") {
+			if clean := strings.TrimSpace(p); clean != "" {
+				trustedProxies = append(trustedProxies, clean)
+			}
+		}
+	}
+
 	isPostgres := strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://")
 	if !isPostgres {
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
@@ -1286,7 +1382,8 @@ func main() {
 	}
 	defer storeDB.Close()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	var pricePaise int64
 	// Treat the environment value as an initial seed only. Once pricing has
 	// been configured in the database, admin dashboard changes must survive
@@ -1340,26 +1437,74 @@ func main() {
 		log.Printf("[WARN] Failed to bootstrap admin: %v", err)
 	}
 
+	// In dev mode, ensure default kiosk is registered with known credentials
+	if devMode {
+		demoSecret := os.Getenv("XEROXGO_KIOSK_SECRET")
+		if demoSecret == "" {
+			demoSecret = "kiosk-demo-secret-key-32-chars-long"
+		}
+		demoHash := sha256.Sum256([]byte(demoSecret))
+		_ = storeDB.RegisterKiosk(bootstrapCtx, store.Kiosk{
+			KioskID:    "kiosk-demo",
+			SecretHash: hex.EncodeToString(demoHash[:]),
+			Name:       "Default Demo Kiosk",
+			IsActive:   true,
+		})
+	}
+
 	hub := ws.NewHub(storeDB)
 
+	razorpayKeyID := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_ID"))
+	razorpayKeySecret := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_SECRET"))
+
+	var rzpClient payments.RazorpayClient
+	if razorpayKeyID != "" && razorpayKeySecret != "" {
+		c, err := payments.NewClient(razorpayKeyID, razorpayKeySecret, 10*time.Second)
+		if err != nil {
+			log.Printf("Warning: failed to initialize Razorpay client: %v", err)
+		} else {
+			rzpClient = c
+			log.Printf("Razorpay client initialized in Test Mode")
+		}
+	} else if devMode {
+		log.Printf("DevMode notice: RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET not set; payment QR initiation will return 503 until configured")
+	}
+
 	cfg := &serverConfig{
-		addr:               addr,
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: pricePaise,
-		devMode:            devMode,
-		downloadSecret:     []byte(dlSecretStr),
-		webhookSecret:      []byte(whSecretStr),
+		addr:                  addr,
+		dbPath:                dbPath,
+		jobsDir:               jobsDir,
+		pricePerSheetPaise:    pricePaise,
+		devMode:               devMode,
+		downloadSecret:        []byte(dlSecretStr),
+		webhookSecret:         []byte(whSecretStr),
+		pickupPINHMACSecret:   []byte(pickupPinSecretStr),
+		maxActivePINsPerKiosk: maxActivePINs,
+		paymentSessionTTL:     paymentSessionTTL,
+		trustedProxies:        trustedProxies,
+		razorpayKeyID:         razorpayKeyID,
+		razorpayKeySecret:     razorpayKeySecret,
 	}
 
 	app := &appServer{
-		cfg:      cfg,
-		db:       storeDB,
-		hub:      hub,
-		convWake: make(chan struct{}, 1),
+		cfg:            cfg,
+		db:             storeDB,
+		hub:            hub,
+		pinLimiter:     pins.NewRateLimiter(pins.DefaultCooldownConfig()),
+		convWake:       make(chan struct{}, 1),
+		razorpayClient: rzpClient,
+		sessionLocks:   newKeyedMutex(),
+		webhookLocks:   newKeyedMutex(),
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/k/kiosk-demo", http.StatusFound)
+	})
 	mux.HandleFunc("/healthz", app.handleHealthz)
 	mux.HandleFunc("/k/", app.handlePortal)
 
@@ -1386,6 +1531,8 @@ func main() {
 		switch {
 		case strings.HasSuffix(path, "/status"):
 			app.handleOrderStatus(w, r)
+		case strings.HasSuffix(path, "/pin/refresh") || strings.HasSuffix(path, "/refresh-pin"):
+			app.handleOrderRefreshPIN(w, r)
 		case strings.HasSuffix(path, "/simulate-payment"):
 			app.handleSimulatePayment(w, r)
 		case strings.HasSuffix(path, "/pdf"):
@@ -1394,6 +1541,10 @@ func main() {
 			http.NotFound(w, r)
 		}
 	})
+	mux.HandleFunc("/api/kiosk/pin/redeem", app.handleKioskRedeemPIN)
+	mux.HandleFunc("/api/kiosk/payment/initiate-qr", app.handleKioskInitiateQR)
+	mux.HandleFunc("/api/kiosk/payment/qr.png", app.handlePaymentQRImage)
+	mux.HandleFunc("/api/kiosk/payment/status", app.handleKioskPaymentStatus)
 	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
 	mux.HandleFunc("/ws", hub.ServeHTTP)
 
@@ -1444,8 +1595,11 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: corsHandler,
+		Addr:         addr,
+		Handler:      corsHandler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1480,22 +1634,14 @@ func isAllowedOrigin(origin string) bool {
 		return false
 	}
 
-	// Canonical production and staging domains
-	if origin == "https://xeroxgo.vercel.app" || origin == "https://campusprint.vercel.app" {
+	// Canonical production frontend domain
+	if origin == "https://xeroxgo-frontend.vercel.app" {
 		return true
 	}
 
 	// Local development origins
 	if origin == "http://localhost:3000" || origin == "http://localhost:8080" || origin == "http://localhost:5173" ||
 		origin == "http://127.0.0.1:3000" || origin == "http://127.0.0.1:8080" || origin == "http://127.0.0.1:5173" {
-		return true
-	}
-
-	// Preview deployments on Vercel
-	if strings.HasPrefix(origin, "https://campusprint-") && strings.HasSuffix(origin, ".vercel.app") {
-		return true
-	}
-	if strings.HasPrefix(origin, "https://xeroxgo-") && strings.HasSuffix(origin, ".vercel.app") {
 		return true
 	}
 

@@ -432,3 +432,94 @@ func (s *Store) ResetPaperTray(
 
 	return nil
 }
+
+// IsJobCompleted checks whether a job with the specified ID has already reached COMPLETED status.
+// This prevents duplicate printing across daemon restarts, reconnections, or repeated poll events.
+func (s *Store) IsJobCompleted(ctx context.Context, jobID string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return false, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cleanID := strings.TrimSpace(jobID)
+	if cleanID == "" {
+		return false, errors.New("job_id cannot be empty")
+	}
+
+	var exists int
+	err := s.db.QueryRowContext(ctx, "SELECT 1 FROM jobs WHERE job_id = ? AND status = 'COMPLETED' LIMIT 1;", cleanID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to check if job %s is completed: %w", cleanID, err)
+	}
+	return exists == 1, nil
+}
+
+// GetJob queries a job record by its unique job_id.
+// It returns nil, nil if no such job exists.
+func (s *Store) GetJob(ctx context.Context, jobID string) (*StoredJob, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cleanID := strings.TrimSpace(jobID)
+	if cleanID == "" {
+		return nil, errors.New("job_id cannot be empty")
+	}
+
+	query := `
+SELECT job_id, kiosk_id, display_code, download_url, sha256_checksum,
+       total_pages, total_sheets, copies, duplex, start_from_page,
+       status, pages_printed, sheets_printed, error_reason, updated_at_ns
+FROM jobs
+WHERE job_id = ?
+LIMIT 1;`
+
+	row := s.db.QueryRowContext(ctx, query, cleanID)
+
+	var job StoredJob
+	var duplexStr string
+	var statusStr string
+	var updatedAtNS int64
+
+	err := row.Scan(
+		&job.Command.JobID,
+		&job.Command.KioskID,
+		&job.Command.DisplayCode,
+		&job.Command.DownloadURL,
+		&job.Command.SHA256Checksum,
+		&job.Command.TotalPages,
+		&job.Command.TotalSheets,
+		&job.Command.Copies,
+		&duplexStr,
+		&job.Command.StartFromPage,
+		&statusStr,
+		&job.PagesPrinted,
+		&job.SheetsPrinted,
+		&job.ErrorReason,
+		&updatedAtNS,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query job %s: %w", cleanID, err)
+	}
+
+	job.Command.Duplex = contracts.DuplexMode(duplexStr)
+	job.Status = contracts.JobStatus(statusStr)
+	job.UpdatedAt = time.Unix(0, updatedAtNS).UTC()
+
+	return &job, nil
+}

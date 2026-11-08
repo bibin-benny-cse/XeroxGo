@@ -117,8 +117,14 @@ func TestHubRegistersAndSendsJob(t *testing.T) {
 	}
 
 	var received wireMessage
-	if err := wsjson.Read(ctx, conn, &received); err != nil {
-		t.Fatalf("failed to read dispatched job from websocket: %v", err)
+	for {
+		if err := wsjson.Read(ctx, conn, &received); err != nil {
+			t.Fatalf("failed to read dispatched job from websocket: %v", err)
+		}
+		if received.Type == "sync_ads" {
+			continue // skip initial ad sync on connection
+		}
+		break
 	}
 
 	if received.Type != "job" {

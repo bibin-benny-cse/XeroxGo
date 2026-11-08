@@ -15,13 +15,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/skip2/go-qrcode"
-	"golang.org/x/image/font"
 	xdraw "golang.org/x/image/draw"
+	"golang.org/x/image/font"
 	_ "golang.org/x/image/webp"
 	"xeroxgo/pkg/contracts"
 )
@@ -34,11 +32,15 @@ const (
 type ScreenMode string
 
 const (
-	ModeIdle        ScreenMode = "IDLE"
-	ModeDownloading ScreenMode = "DOWNLOADING"
-	ModePrinting    ScreenMode = "PRINTING"
-	ModeCompleted   ScreenMode = "COMPLETED"
-	ModeError       ScreenMode = "ERROR"
+	ModeIdle              ScreenMode = "IDLE"
+	ModePINEntry          ScreenMode = "PIN_ENTRY"
+	ModePaymentQR         ScreenMode = "PAYMENT_QR"
+	ModeWaitingForPayment ScreenMode = "WAITING_FOR_PAYMENT"
+	ModePaymentFailed     ScreenMode = "PAYMENT_FAILED"
+	ModeDownloading       ScreenMode = "DOWNLOADING"
+	ModePrinting          ScreenMode = "PRINTING"
+	ModeCompleted         ScreenMode = "COMPLETED"
+	ModeError             ScreenMode = "ERROR"
 )
 
 type ScreenState struct {
@@ -53,32 +55,44 @@ type ScreenState struct {
 	AdSlideIndex    int     // 0: Quick & Easy, 1: High Quality Prints, 2: Skip The Queue
 	TransitionFrom  int     // -1 if static; 0, 1, or 2 if transitioning from that slide
 	TransitionProg  float64 // 0.0 to 1.0 progress of slide transition
+
+	// Pickup PIN and Payment workflow fields (Stage 4)
+	PIN              string      // 4-digit numeric PIN, preserving leading zeros (e.g. "0482")
+	PINError         string      // Validation/rate-limit error message on PIN entry screen
+	OrderID          string      // Order identifier (e.g. "ord_abc123")
+	AmountPaise      int64       // Payable amount in paise (e.g. 500 = ₹5.00)
+	PaymentQRURL     string      // Razorpay UPI QR code URL or UPI URI string
+	PaymentQRImage   image.Image // Pre-decoded or downloaded QR image
+	PaymentExpiresAt time.Time   // Expiration timestamp for payment countdown
+	PaymentStatus    string      // e.g. "Awaiting payment verification..."
+	PaymentError     string      // Reason for payment failure or timeout
+	CanRetryPayment  bool        // True if the active payment session can be retried without PIN re-entry
 }
 
 type Sink func(*image.RGBA) error
 
 var (
 	// Frontend portal.css aligned palette
-	colorBgSlate        = color.RGBA{R: 248, G: 250, B: 252, A: 255} // #F8FAFC
-	colorCardBg         = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
-	colorBorder         = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
-	colorBorderDark     = color.RGBA{R: 203, G: 213, B: 225, A: 255} // #CBD5E1
-	colorPrimaryBlue    = color.RGBA{R: 37, G: 99, B: 235, A: 255}   // #2563EB
-	colorAccentBlue     = colorPrimaryBlue                           // Alias for tests
-	colorSuccessGreen   = color.RGBA{R: 16, G: 185, B: 129, A: 255}  // #10B981
-	colorWarningAmber   = color.RGBA{R: 245, G: 158, B: 11, A: 255}  // #F59E0B
-	colorErrorRed       = color.RGBA{R: 239, G: 68, B: 68, A: 255}   // #EF4444
-	colorTextPrimary    = color.RGBA{R: 30, G: 41, B: 59, A: 255}    // #1E293B
-	colorTextMutedDark  = color.RGBA{R: 51, G: 65, B: 85, A: 255}    // #334155 (Slate-700, dark gray)
-	colorTextSecondary  = color.RGBA{R: 100, G: 116, B: 139, A: 255} // #64748B
-	colorTextWhite      = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
-	colorBarBg          = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
-	colorPillBlueBg     = color.RGBA{R: 239, G: 246, B: 255, A: 255} // #EFF6FF
-	colorPillBlueBorder = color.RGBA{R: 191, G: 219, B: 254, A: 255} // #BFDBFE
-	colorPillGreenBg    = color.RGBA{R: 236, G: 253, B: 245, A: 255} // #ECFDF5
-	colorPillGreenBorder= color.RGBA{R: 167, G: 243, B: 208, A: 255} // #A7F3D0
-	colorPillRedBg      = color.RGBA{R: 254, G: 242, B: 242, A: 255} // #FEF2F2
-	colorPillRedBorder  = color.RGBA{R: 254, G: 202, B: 202, A: 255} // #FECACA
+	colorBgSlate         = color.RGBA{R: 248, G: 250, B: 252, A: 255} // #F8FAFC
+	colorCardBg          = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
+	colorBorder          = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
+	colorBorderDark      = color.RGBA{R: 203, G: 213, B: 225, A: 255} // #CBD5E1
+	colorPrimaryBlue     = color.RGBA{R: 37, G: 99, B: 235, A: 255}   // #2563EB
+	colorAccentBlue      = colorPrimaryBlue                           // Alias for tests
+	colorSuccessGreen    = color.RGBA{R: 16, G: 185, B: 129, A: 255}  // #10B981
+	colorWarningAmber    = color.RGBA{R: 245, G: 158, B: 11, A: 255}  // #F59E0B
+	colorErrorRed        = color.RGBA{R: 239, G: 68, B: 68, A: 255}   // #EF4444
+	colorTextPrimary     = color.RGBA{R: 30, G: 41, B: 59, A: 255}    // #1E293B
+	colorTextMutedDark   = color.RGBA{R: 51, G: 65, B: 85, A: 255}    // #334155 (Slate-700, dark gray)
+	colorTextSecondary   = color.RGBA{R: 100, G: 116, B: 139, A: 255} // #64748B
+	colorTextWhite       = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
+	colorBarBg           = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
+	colorPillBlueBg      = color.RGBA{R: 239, G: 246, B: 255, A: 255} // #EFF6FF
+	colorPillBlueBorder  = color.RGBA{R: 191, G: 219, B: 254, A: 255} // #BFDBFE
+	colorPillGreenBg     = color.RGBA{R: 236, G: 253, B: 245, A: 255} // #ECFDF5
+	colorPillGreenBorder = color.RGBA{R: 167, G: 243, B: 208, A: 255} // #A7F3D0
+	colorPillRedBg       = color.RGBA{R: 254, G: 242, B: 242, A: 255} // #FEF2F2
+	colorPillRedBorder   = color.RGBA{R: 254, G: 202, B: 202, A: 255} // #FECACA
 )
 
 var renderMu sync.Mutex
@@ -90,6 +104,20 @@ func (state ScreenState) Validate() error {
 		if strings.TrimSpace(state.QRContent) == "" {
 			return fmt.Errorf("idle mode: QRContent cannot be empty or whitespace-only")
 		}
+	case ModePINEntry:
+		if len(state.PIN) > 4 {
+			return fmt.Errorf("pin entry mode: PIN length cannot exceed 4 digits, got %q", state.PIN)
+		}
+	case ModePaymentQR:
+		if state.AmountPaise < 0 {
+			return fmt.Errorf("payment qr mode: AmountPaise cannot be negative, got %d", state.AmountPaise)
+		}
+	case ModeWaitingForPayment:
+		if state.AmountPaise < 0 {
+			return fmt.Errorf("waiting for payment mode: AmountPaise cannot be negative, got %d", state.AmountPaise)
+		}
+	case ModePaymentFailed:
+		// Valid
 	case ModeDownloading:
 		if state.ProgressPercent < 0 || state.ProgressPercent > 100 {
 			return fmt.Errorf("downloading mode: ProgressPercent must be between 0 and 100, got %d", state.ProgressPercent)
@@ -154,6 +182,14 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 
 	// 4. Mode-specific content
 	switch state.Mode {
+	case ModePINEntry:
+		renderPINEntry(fullCanvas, state)
+	case ModePaymentQR:
+		renderPaymentQR(fullCanvas, state)
+	case ModeWaitingForPayment:
+		renderWaitingForPayment(fullCanvas, state)
+	case ModePaymentFailed:
+		renderPaymentFailed(fullCanvas, state)
 	case ModeDownloading:
 		renderDownloading(fullCanvas, state)
 	case ModePrinting:
@@ -454,7 +490,8 @@ func initAdSlides() {
 	}
 }
 
-func getQRCodeImage(content string) (image.Image, error) {
+// GetQRCodeImage encodes a string into an in-memory QR code image with caching.
+func GetQRCodeImage(content string) (image.Image, error) {
 	qrCacheMu.Lock()
 	defer qrCacheMu.Unlock()
 	if content == cachedQRContent && cachedQRImg != nil {
@@ -471,6 +508,10 @@ func getQRCodeImage(content string) (image.Image, error) {
 	cachedQRContent = content
 	cachedQRImg = img
 	return img, nil
+}
+
+func getQRCodeImage(content string) (image.Image, error) {
+	return GetQRCodeImage(content)
 }
 
 // getIdleBase pre-renders the static elements of the Idle screen (header, right card, QR, steps, footer).
@@ -525,7 +566,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	// Action pill under QR with website link
 	pillRect := image.Rect(1355, 626, 1815, 682)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
-	displayLink := "xeroxgo.vercel.app"
+	displayLink := "xeroxgo-frontend.vercel.app"
 	if strings.TrimSpace(qrContent) != "" {
 		cleaned := strings.TrimSpace(qrContent)
 		if strings.HasPrefix(cleaned, "http://") || strings.HasPrefix(cleaned, "https://") {
@@ -741,6 +782,254 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	}
 
 	return nil
+}
+
+func renderPINEntry(dst *image.RGBA, state ScreenState) {
+	card := image.Rect(30, 140, 1890, 1050)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	// Title
+	drawText(dst, faceBold56, "Enter 4-Digit Pickup PIN", 90, 220, colorPrimaryBlue)
+
+	msg := state.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "Enter the 4-digit numeric PIN provided on your mobile order confirmation screen"
+	}
+	drawText(dst, faceReg32, msg, 90, 295, colorTextPrimary)
+
+	// 4 PIN Boxes: 140px wide, 160px high, spaced 36px
+	// Total width = 4*140 + 3*36 = 560 + 108 = 668px
+	// Centered in card (dx=1860, minX=30): startX = 30 + (1860-668)/2 = 626
+	boxW := 140
+	boxH := 160
+	boxGap := 36
+	startX := 626
+	boxY := 390
+
+	pinStr := state.PIN
+	for i := 0; i < 4; i++ {
+		bX := startX + i*(boxW+boxGap)
+		boxRect := image.Rect(bX, boxY, bX+boxW, boxY+boxH)
+
+		hasDigit := i < len(pinStr)
+		if hasDigit {
+			fillRoundedRect(dst, boxRect, 18, colorPillBlueBg)
+			strokeRoundedRect(dst, boxRect, 18, 3, colorPrimaryBlue)
+			digitChar := string(pinStr[i])
+			dW := measureTextWidth(faceBold56, digitChar)
+			drawText(dst, faceBold56, digitChar, bX+(boxW-dW)/2, boxY+48, colorTextPrimary)
+		} else {
+			fillRoundedRect(dst, boxRect, 18, colorBgSlate)
+			strokeRoundedRect(dst, boxRect, 18, 2, colorBorder)
+			dash := "-"
+			dW := measureTextWidth(faceBold56, dash)
+			drawText(dst, faceBold56, dash, bX+(boxW-dW)/2, boxY+48, colorTextSecondary)
+		}
+	}
+
+	// Error banner if any
+	if strings.TrimSpace(state.PINError) != "" {
+		errBox := image.Rect(450, 595, 1470, 665)
+		drawPill(dst, errBox, colorPillRedBg, colorPillRedBorder)
+		eW := measureTextWidth(faceBold22, state.PINError)
+		drawText(dst, faceBold22, state.PINError, errBox.Min.X+(errBox.Dx()-eW)/2, 617, colorErrorRed)
+	}
+
+	// Guidance / Instructions box
+	instBox := image.Rect(90, 715, 1830, 985)
+	fillRoundedRect(dst, instBox, 20, colorBgSlate)
+	strokeRoundedRect(dst, instBox, 20, 2, colorBorder)
+
+	drawText(dst, faceBold28, "How the 4-digit pickup PIN works:", 140, 765, colorTextPrimary)
+	drawText(dst, faceReg24, "1. Upload your file at xeroxgo-frontend.vercel.app from your phone camera or browser.", 140, 825, colorTextSecondary)
+	drawText(dst, faceReg24, "2. A 4-digit pickup PIN is generated exclusively for your order (valid for 15 minutes).", 140, 875, colorTextSecondary)
+	drawText(dst, faceReg24, "3. Enter your PIN on this kiosk to initiate secure UPI payment and collect your prints.", 140, 925, colorTextSecondary)
+}
+
+func renderPaymentQR(dst *image.RGBA, state ScreenState) {
+	card := image.Rect(30, 140, 1890, 1050)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	// Title
+	drawText(dst, faceBold56, "Scan UPI QR to Pay & Print", 90, 220, colorPrimaryBlue)
+
+	msg := state.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "Use Google Pay, PhonePe, Paytm, BHIM, or any UPI banking app"
+	}
+	drawText(dst, faceReg32, msg, 90, 290, colorTextPrimary)
+
+	// Left: QR Code Card (540x590)
+	qrCard := image.Rect(90, 340, 670, 980)
+	fillRoundedRect(dst, qrCard, 24, colorCardBg)
+	strokeRoundedRect(dst, qrCard, 24, 2, colorBorder)
+
+	qrBounds := image.Rect(145, 380, 615, 850)
+	var qrImg image.Image
+	if state.PaymentQRImage != nil {
+		qrImg = state.PaymentQRImage
+	} else if strings.TrimSpace(state.PaymentQRURL) != "" {
+		if q, err := getQRCodeImage(state.PaymentQRURL); err == nil {
+			qrImg = q
+		}
+	}
+
+	if qrImg != nil {
+		xdraw.BiLinear.Scale(dst, qrBounds, qrImg, qrImg.Bounds(), xdraw.Over, nil)
+	} else {
+		// Placeholder box when QR is loading
+		fillRoundedRect(dst, qrBounds, 16, colorBgSlate)
+		strokeRoundedRect(dst, qrBounds, 16, 2, colorBorder)
+		loadingText := "Generating Secure UPI QR..."
+		lW := measureTextWidth(faceBold24, loadingText)
+		drawText(dst, faceBold24, loadingText, qrBounds.Min.X+(qrBounds.Dx()-lW)/2, 600, colorTextSecondary)
+	}
+
+	// QR footer note
+	acceptedText := "Instant UPI Payment • Test Mode"
+	aW := measureTextWidth(faceBold20, acceptedText)
+	drawText(dst, faceBold20, acceptedText, qrCard.Min.X+(qrCard.Dx()-aW)/2, 900, colorPrimaryBlue)
+
+	// Right: Payment & Order Details (width: 1100, height: 640)
+	detailCard := image.Rect(720, 340, 1830, 980)
+	fillRoundedRect(dst, detailCard, 24, colorBgSlate)
+	strokeRoundedRect(dst, detailCard, 24, 2, colorBorder)
+
+	// Amount Callout Banner
+	amountBanner := image.Rect(760, 380, 1790, 520)
+	fillRoundedRect(dst, amountBanner, 18, colorCardBg)
+	strokeRoundedRect(dst, amountBanner, 18, 2, colorBorder)
+
+	rupees := float64(state.AmountPaise) / 100.0
+	amountStr := fmt.Sprintf("₹%.2f", rupees)
+	drawText(dst, faceBold24, "Total Amount to Pay:", 800, 420, colorTextSecondary)
+	drawText(dst, faceBold56, amountStr, 800, 465, colorPrimaryBlue)
+
+	// Order metadata row
+	if strings.TrimSpace(state.OrderID) != "" {
+		orderPill := image.Rect(760, 550, 1180, 610)
+		drawPill(dst, orderPill, colorPillBlueBg, colorPillBlueBorder)
+		drawText(dst, faceBold22, "Order: "+state.OrderID, 785, 570, colorPrimaryBlue)
+	}
+
+	// Expiry countdown pill
+	if !state.PaymentExpiresAt.IsZero() {
+		rem := time.Until(state.PaymentExpiresAt)
+		if rem > 0 {
+			mins := int(rem.Minutes())
+			secs := int(rem.Seconds()) % 60
+			expText := fmt.Sprintf("QR expires in %02d:%02d", mins, secs)
+			expPill := image.Rect(1220, 550, 1680, 610)
+			drawPill(dst, expPill, colorPillBlueBg, colorPillBlueBorder)
+			drawText(dst, faceBold22, expText, 1250, 570, colorPrimaryBlue)
+		}
+	}
+
+	// Instructions
+	instY := 655
+	drawText(dst, faceBold28, "Payment Instructions:", 760, instY, colorTextPrimary)
+	steps := []string{
+		"1. Open any UPI application on your mobile device (GPay, PhonePe, Paytm, etc.).",
+		"2. Point your camera at the QR code on the left and scan.",
+		"3. Verify amount " + amountStr + " and authorize payment with your UPI PIN.",
+		"4. Printing starts automatically as soon as payment is confirmed.",
+	}
+	for i, step := range steps {
+		yPos := instY + 50 + i*48
+		col := colorTextPrimary
+		if i == 3 {
+			col = colorSuccessGreen
+		}
+		drawText(dst, faceBold22, step, 760, yPos, col)
+	}
+
+	// Security note at bottom right
+	drawText(dst, faceReg18, "🔒 End-to-end verified via Razorpay webhook. No cash or cards needed.", 760, 930, colorTextSecondary)
+}
+
+func renderWaitingForPayment(dst *image.RGBA, state ScreenState) {
+	card := image.Rect(30, 140, 1890, 1050)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	// Title
+	drawText(dst, faceBold56, "Waiting for Payment...", 90, 220, colorPrimaryBlue)
+
+	msg := state.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "Please complete the UPI transfer on your mobile phone."
+	}
+	drawText(dst, faceReg32, msg, 90, 295, colorTextPrimary)
+
+	// Amount pill
+	rupees := float64(state.AmountPaise) / 100.0
+	amountStr := fmt.Sprintf("₹%.2f", rupees)
+	amountPill := image.Rect(90, 360, 480, 420)
+	drawPill(dst, amountPill, colorPillBlueBg, colorPillBlueBorder)
+	drawText(dst, faceBold28, "Amount: "+amountStr, 120, 377, colorPrimaryBlue)
+
+	if strings.TrimSpace(state.OrderID) != "" {
+		orderPill := image.Rect(510, 360, 920, 420)
+		drawPill(dst, orderPill, colorBgSlate, colorBorder)
+		drawText(dst, faceBold22, "Order ID: "+state.OrderID, 535, 380, colorTextSecondary)
+	}
+
+	// Main status container
+	boxRect := image.Rect(90, 460, 1830, 860)
+	fillRoundedRect(dst, boxRect, 20, colorBgSlate)
+	strokeRoundedRect(dst, boxRect, 20, 2, colorBorder)
+
+	statusText := state.PaymentStatus
+	if strings.TrimSpace(statusText) == "" {
+		statusText = "Awaiting bank confirmation..."
+	}
+	drawText(dst, faceBold36, statusText, 140, 530, colorTextPrimary)
+
+	drawText(dst, faceBold24, "Do not leave this screen or navigate away.", 140, 610, colorPrimaryBlue)
+	drawText(dst, faceReg24, "Your transaction is being confirmed by your bank and the Razorpay gateway.", 140, 670, colorTextSecondary)
+	drawText(dst, faceReg24, "As soon as payment is confirmed, this screen will switch directly to printing.", 140, 730, colorTextSecondary)
+	drawText(dst, faceReg24, "Thank you for your patience!", 140, 790, colorTextSecondary)
+}
+
+func renderPaymentFailed(dst *image.RGBA, state ScreenState) {
+	card := image.Rect(30, 140, 1890, 1050)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	// Title
+	drawText(dst, faceBold56, "Payment Failed or Expired", 90, 220, colorErrorRed)
+
+	msg := state.PaymentError
+	if strings.TrimSpace(msg) == "" {
+		msg = "The payment could not be completed or the time limit expired."
+	}
+	drawText(dst, faceReg32, msg, 90, 295, colorTextPrimary)
+
+	// Status pill
+	pill := image.Rect(90, 360, 650, 420)
+	drawPill(dst, pill, colorPillRedBg, colorPillRedBorder)
+	drawText(dst, faceBold22, "Status: Payment Incomplete", 120, 380, colorErrorRed)
+
+	// Recovery instructions box
+	boxRect := image.Rect(90, 460, 1830, 920)
+	fillRoundedRect(dst, boxRect, 20, color.RGBA{R: 255, G: 251, B: 235, A: 255})
+	strokeRoundedRect(dst, boxRect, 20, 2, color.RGBA{R: 253, G: 230, B: 138, A: 255})
+
+	drawText(dst, faceBold28, "What to do next:", 140, 520, color.RGBA{R: 180, G: 83, B: 9, A: 255})
+
+	if state.CanRetryPayment {
+		drawText(dst, faceBold24, "1. Your payment session is still active! You can retry without re-entering your PIN.", 140, 580, colorTextPrimary)
+		drawText(dst, faceBold24, "2. A new UPI QR code will be generated for your existing order.", 140, 640, colorTextPrimary)
+		drawText(dst, faceReg24, "3. Check your UPI app to ensure your bank balance is sufficient.", 140, 700, colorTextSecondary)
+		drawText(dst, faceReg24, "4. If you wish to cancel, this screen will automatically return to Idle.", 140, 760, colorTextSecondary)
+	} else {
+		drawText(dst, faceBold24, "1. Your pickup PIN or payment session has expired.", 140, 580, colorTextPrimary)
+		drawText(dst, faceBold24, "2. Open your phone browser and refresh your order confirmation page.", 140, 640, colorTextPrimary)
+		drawText(dst, faceReg24, "3. Generate a fresh 4-digit PIN and re-enter it at this kiosk.", 140, 700, colorTextSecondary)
+		drawText(dst, faceReg24, "4. Your uploaded document is preserved and will not need to be uploaded again.", 140, 760, colorTextSecondary)
+	}
 }
 
 func renderDownloading(dst *image.RGBA, state ScreenState) {
@@ -1025,7 +1314,10 @@ func FilePreviewSink(pngPath string) Sink {
 		}
 
 		if err := os.Rename(tmpName, pngPath); err != nil {
-			return fmt.Errorf("failed to atomically rename preview file: %w", err)
+			_ = os.Remove(pngPath)
+			if err2 := os.Rename(tmpName, pngPath); err2 != nil {
+				return fmt.Errorf("failed to atomically rename preview file: %w", err)
+			}
 		}
 
 		cleanup = false
@@ -1131,7 +1423,7 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 			totalBytes := geom.Stride * geom.Height
 			info, sErr := cachedFile.Stat()
 			if sErr == nil && (info.Mode()&os.ModeDevice != 0) && totalBytes > 0 {
-				if m, mErr := syscall.Mmap(int(cachedFile.Fd()), 0, totalBytes, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED); mErr == nil {
+				if m, mErr := mmapFB(cachedFile.Fd(), totalBytes); mErr == nil {
 					cachedMmap = m
 				}
 			}
@@ -1237,8 +1529,7 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 
 		if cachedMmap != nil && len(cachedMmap) >= totalBytes {
 			// Synchronize with hardware VBLANK on Linux framebuffer to eliminate shearing/tearing
-			var crtc uint32 = 0
-			_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, cachedFile.Fd(), 0x40044620, uintptr(unsafe.Pointer(&crtc)))
+			syncVBlank(cachedFile.Fd())
 			copy(cachedMmap[:totalBytes], buf)
 			return nil
 		}
@@ -1248,6 +1539,10 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 			cachedFile = nil
 			cachedMmap = nil
 			return fmt.Errorf("write framebuffer: %w", err)
+		}
+		if fi, err := cachedFile.Stat(); err == nil && (fi.Mode()&os.ModeDevice == 0) {
+			_ = cachedFile.Close()
+			cachedFile = nil
 		}
 		return nil
 	}

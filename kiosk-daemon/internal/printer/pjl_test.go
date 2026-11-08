@@ -31,8 +31,25 @@ func samplePrintCommand(jobID string) contracts.PrintJobCommand {
 	}
 }
 
+var loopbackSupported = sync.OnceValue(func() bool {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return false
+	}
+	defer l.Close()
+	c, err := net.DialTimeout("tcp", l.Addr().String(), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+})
+
 func startMockPrinter(t *testing.T) (net.Listener, string) {
 	t.Helper()
+	if !loopbackSupported() {
+		t.Skip("skipping PJL socket test: loopback TCP blocked in current environment")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to start mock printer listener: %v", err)

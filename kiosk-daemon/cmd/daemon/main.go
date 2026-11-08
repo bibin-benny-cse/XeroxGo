@@ -106,7 +106,6 @@ func startMockPrinter(ctx context.Context, downloadDir string, wg *sync.WaitGrou
 	return ln.Addr().String(), cleanup, nil
 }
 
-
 func handleMockPrinterConn(conn net.Conn, downloadDir string) {
 	defer conn.Close()
 
@@ -225,6 +224,9 @@ func main() {
 	previewPNG := flag.String("preview-png", "", "Path to write preview PNG instead of writing to framebuffer")
 	cloudURL := flag.String("cloud-url", "ws://127.0.0.1:8080/ws", "Cloud WebSocket hub endpoint")
 	kioskID := flag.String("kiosk-id", "kiosk-001", "Kiosk identifier")
+	kioskSecret := flag.String("kiosk-secret", "", "[Deprecated] Secret credential for kiosk authentication; prefer XEROXGO_KIOSK_SECRET env or protected credentials file")
+	credentialsFile := flag.String("credentials-file", "", "Path to protected credentials file containing kiosk secret (defaults to XEROXGO_CREDENTIALS_FILE env or /etc/xeroxgo/kiosk.secret)")
+	backendURL := flag.String("backend-url", "", "HTTP base URL for cloud backend REST API (defaults to XEROXGO_BACKEND_URL env or derived from -cloud-url)")
 	stateDB := flag.String("state-db", "/var/kiosk/state.db", "SQLite state database path")
 	downloadDir := flag.String("download-dir", "/var/kiosk/jobs", "Directory for downloaded PDF jobs")
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
@@ -241,6 +243,7 @@ func main() {
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
+	caCert := flag.String("ca-cert", "", "Path to custom trusted CA certificate PEM file for TLS verification (defaults to XEROXGO_CA_CERT env)")
 	flag.Parse()
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
@@ -263,7 +266,7 @@ func main() {
 			}
 			*idleQRContent = fmt.Sprintf("%s://%s/k/%s", scheme, u.Host, url.PathEscape(*kioskID))
 		} else {
-			*idleQRContent = "https://xeroxgo.vercel.app"
+			*idleQRContent = "https://xeroxgo-frontend.vercel.app"
 		}
 	}
 
@@ -366,9 +369,56 @@ func main() {
 		}
 	}
 
+	// 1. Prefer environment variable XEROXGO_KIOSK_SECRET
+	effectiveKioskSecret := strings.TrimSpace(os.Getenv("XEROXGO_KIOSK_SECRET"))
+
+	// 2. Protected configuration / credentials file
+	if effectiveKioskSecret == "" {
+		credPath := strings.TrimSpace(*credentialsFile)
+		if credPath == "" {
+			credPath = strings.TrimSpace(os.Getenv("XEROXGO_CREDENTIALS_FILE"))
+		}
+		if credPath == "" {
+			defaultPath := "/etc/xeroxgo/kiosk.secret"
+			if _, err := os.Stat(defaultPath); err == nil {
+				credPath = defaultPath
+			}
+		}
+		if credPath != "" {
+			if secretBytes, err := os.ReadFile(credPath); err == nil {
+				effectiveKioskSecret = strings.TrimSpace(string(secretBytes))
+			}
+		}
+	}
+
+	// 3. Fallback: CLI flag (warn against passing secrets on CLI to prevent exposure in ps/history)
+	if effectiveKioskSecret == "" && strings.TrimSpace(*kioskSecret) != "" {
+		log.Printf("[SECURITY] Notice: Prefer setting XEROXGO_KIOSK_SECRET or using a protected credentials file instead of passing --kiosk-secret via CLI")
+		effectiveKioskSecret = strings.TrimSpace(*kioskSecret)
+	}
+
+	effectiveBackendURL := strings.TrimSpace(*backendURL)
+	if effectiveBackendURL == "" {
+		effectiveBackendURL = strings.TrimSpace(os.Getenv("XEROXGO_BACKEND_URL"))
+	}
+	if effectiveBackendURL == "" {
+		u, err := url.Parse(*cloudURL)
+		if err == nil && u.Host != "" {
+			scheme := "http"
+			if u.Scheme == "wss" {
+				scheme = "https"
+			}
+			effectiveBackendURL = fmt.Sprintf("%s://%s", scheme, u.Host)
+		} else {
+			effectiveBackendURL = "http://127.0.0.1:8080"
+		}
+	}
+
 	clientCfg := spooler.ClientConfig{
 		CloudURL:                 *cloudURL,
 		KioskID:                  *kioskID,
+		KioskSecret:              effectiveKioskSecret,
+		BackendBaseURL:           effectiveBackendURL,
 		StateStore:               stateStore,
 		PrinterAddr:              actualPrinterAddr,
 		SNMPTarget:               *snmpTarget,
@@ -382,12 +432,20 @@ func main() {
 		CompletedDisplayDuration: *completedTimeout,
 		ScreenSink:               screenSink,
 		HTTPClient:               nil,
+		RootCAPath:               strings.TrimSpace(*caCert),
 		MockHealth:               mockHealthPoller,
 	}
 
 	client, err := spooler.NewClient(clientCfg)
 	if err != nil {
 		log.Fatalf("Fatal: failed to create spooler client: %v", err)
+	}
+
+	keypad := client.Keypad()
+	if keypad != nil {
+		go func() {
+			_ = keypad.ReadLoop(ctx, os.Stdin)
+		}()
 	}
 
 	startSystemdWatchdog(ctx, &rootWg)

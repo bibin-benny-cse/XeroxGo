@@ -103,7 +103,7 @@ The current backend writes jobs to disk. Render's default filesystem is ephemera
 The existing `frontend/vercel.json` rewrites `/api/*` and `/healthz` to:
 
 ```text
-https://xeroxgo-cloud.onrender.com
+https://xeroxgo-7s6i.onrender.com
 ```
 
 If Render gives the service a different URL, replace that hostname in all three relevant places in `frontend/vercel.json`:

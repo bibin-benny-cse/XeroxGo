@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"xeroxgo/cloud-backend/internal/pins"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 )
@@ -36,19 +37,22 @@ func setupTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
+		addr:                  "localhost:0",
+		dbPath:                dbPath,
+		jobsDir:               jobsDir,
+		pricePerSheetPaise:    200,
+		downloadSecret:        []byte("test_secret_key_1234567890"),
+		pickupPINHMACSecret:   []byte("test_pickup_pin_hmac_secret_32_bytes_1234"),
+		maxActivePINsPerKiosk: 50,
 	}
 
 	hub := ws.NewHub(s)
 	app := &appServer{
-		cfg:      cfg,
-		db:       s,
-		hub:      hub,
-		convWake: make(chan struct{}, 100),
+		cfg:        cfg,
+		db:         s,
+		hub:        hub,
+		pinLimiter: pins.NewRateLimiter(pins.DefaultCooldownConfig()),
+		convWake:   make(chan struct{}, 100),
 	}
 
 	mux := http.NewServeMux()
@@ -339,4 +343,3 @@ func TestAsyncConversion_FailureReporting(t *testing.T) {
 		t.Fatalf("expected non-empty error message on failure")
 	}
 }
-

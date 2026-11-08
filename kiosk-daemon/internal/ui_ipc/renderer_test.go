@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"xeroxgo/pkg/contracts"
 )
@@ -24,6 +25,56 @@ func TestRenderAllModes(t *testing.T) {
 				Mode:      ModeIdle,
 				QRContent: "https://kiosk.xeroxgo.edu/session/test-session-123",
 				Message:   "Ready for new print job",
+			},
+		},
+		{
+			name: "pin entry mode with leading zero",
+			state: ScreenState{
+				Mode: ModePINEntry,
+				PIN:  "0482",
+			},
+		},
+		{
+			name: "pin entry mode with error",
+			state: ScreenState{
+				Mode:     ModePINEntry,
+				PIN:      "04",
+				PINError: "Invalid or expired pickup PIN. Please check your phone.",
+			},
+		},
+		{
+			name: "payment qr mode",
+			state: ScreenState{
+				Mode:             ModePaymentQR,
+				OrderID:          "ord_test123",
+				AmountPaise:      1500,
+				PaymentQRURL:     "upi://pay?pa=xeroxgo@icici&pn=XeroxGo&am=15.00&tr=ord_test123",
+				PaymentExpiresAt: time.Now().Add(10 * time.Minute),
+			},
+		},
+		{
+			name: "waiting for payment mode",
+			state: ScreenState{
+				Mode:          ModeWaitingForPayment,
+				OrderID:       "ord_test123",
+				AmountPaise:   1500,
+				PaymentStatus: "Contacting payment gateway...",
+			},
+		},
+		{
+			name: "payment failed mode with retry",
+			state: ScreenState{
+				Mode:            ModePaymentFailed,
+				PaymentError:    "Payment attempt timed out",
+				CanRetryPayment: true,
+			},
+		},
+		{
+			name: "payment failed mode without retry",
+			state: ScreenState{
+				Mode:            ModePaymentFailed,
+				PaymentError:    "Session expired",
+				CanRetryPayment: false,
 			},
 		},
 		{
@@ -245,6 +296,18 @@ func TestRenderRejectsInvalidState(t *testing.T) {
 			name:  "printing with current page greater than total pages",
 			state: ScreenState{Mode: ModePrinting, CurrentPage: 6, TotalPages: 5},
 		},
+		{
+			name:  "pin entry with PIN exceeding 4 digits",
+			state: ScreenState{Mode: ModePINEntry, PIN: "12345"},
+		},
+		{
+			name:  "payment qr with negative amount",
+			state: ScreenState{Mode: ModePaymentQR, AmountPaise: -1},
+		},
+		{
+			name:  "waiting for payment with negative amount",
+			state: ScreenState{Mode: ModeWaitingForPayment, AmountPaise: -10},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -318,9 +381,9 @@ func TestFilePreviewSink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open preview file: %v", err)
 	}
-	defer f.Close()
 
 	decoded, err := png.Decode(f)
+	_ = f.Close()
 	if err != nil {
 		t.Fatalf("png.Decode failed on written preview: %v", err)
 	}
@@ -751,4 +814,3 @@ func TestConfigureAdsDynamic(t *testing.T) {
 		t.Fatal("expected non-nil render output")
 	}
 }
-

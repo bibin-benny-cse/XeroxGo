@@ -9,10 +9,12 @@ func TestIsAllowedOrigin(t *testing.T) {
 		origin  string
 		allowed bool
 	}{
-		{"https://xeroxgo.vercel.app", true},
-		{"https://campusprint.vercel.app", true},
-		{"https://campusprint-preview-123.vercel.app", true},
-		{"https://xeroxgo-preview-456.vercel.app", true},
+		{"https://xeroxgo-frontend.vercel.app", true},
+		{"https://untrusted.example", false},
+		{"https://campusprint.vercel.app", false},
+		{"https://campusprint-preview-123.vercel.app", false},
+		{"https://xeroxgo-preview-456.vercel.app", false},
+		{"https://xeroxgo-malicious.vercel.app", false},
 		{"http://localhost:3000", true},
 		{"http://localhost:8080", true},
 		{"http://localhost:5173", true},
@@ -31,6 +33,18 @@ func TestIsAllowedOrigin(t *testing.T) {
 		if got != tt.allowed {
 			t.Errorf("isAllowedOrigin(%q) = %v; want %v", tt.origin, got, tt.allowed)
 		}
+	}
+
+	// Verify XEROXGO_ALLOWED_ORIGINS environment variable overrides
+	t.Setenv("XEROXGO_ALLOWED_ORIGINS", "https://custom-preview.example.com, https://staging.example.org")
+	if !isAllowedOrigin("https://custom-preview.example.com") {
+		t.Errorf("expected custom env origin to be allowed")
+	}
+	if !isAllowedOrigin("https://staging.example.org") {
+		t.Errorf("expected custom env origin to be allowed")
+	}
+	if isAllowedOrigin("https://other.example.com") {
+		t.Errorf("expected unlisted origin to be rejected")
 	}
 }
 
@@ -57,4 +71,3 @@ func TestSanitizeCSVField(t *testing.T) {
 		}
 	}
 }
-

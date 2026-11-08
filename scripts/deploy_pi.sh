@@ -26,10 +26,10 @@ ssh -t "${PI_HOST}" "bash -c '
     else
         nohup /home/xg1/xeroxgo-kiosk \
             --kiosk-id=kiosk-demo \
-            --cloud-url=wss://xeroxgo-cloud.onrender.com/ws \
+            --cloud-url=wss://xeroxgo-7s6i.onrender.com/ws \
             --cups-printer=DCPT310 \
             --framebuffer=/dev/fb0 \
-            --idle-qr-content=https://xeroxgo.vercel.app > /tmp/xeroxgo-kiosk.log 2>&1 &
+            --idle-qr-content=https://xeroxgo-frontend.vercel.app > /tmp/xeroxgo-kiosk.log 2>&1 &
         echo \"xeroxgo-kiosk launched directly on /dev/fb0.\"
     fi
 '"

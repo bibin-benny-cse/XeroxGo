@@ -64,7 +64,7 @@ func main() {
 	logoB64 := base64.StdEncoding.EncodeToString(logoBytes)
 
 	// Generate QR code PNG and base64 encode
-	qrPng, _ := qrcode.Encode("https://xeroxgo.vercel.app", qrcode.Medium, 400)
+	qrPng, _ := qrcode.Encode("https://xeroxgo-frontend.vercel.app", qrcode.Medium, 400)
 	qrB64 := base64.StdEncoding.EncodeToString(qrPng)
 
 	screens := []struct {
@@ -190,7 +190,7 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
       <!-- Action Pill with Website Link -->
       <g id="ActionPill" transform="translate(1355, 626)">
         <rect width="460" height="56" rx="28" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-        <text x="230" y="36" fill="#2563EB" font-size="24" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
+        <text x="230" y="36" fill="#2563EB" font-size="24" font-weight="700" text-anchor="middle">xeroxgo-frontend.vercel.app</text>
       </g>
 
       <!-- 3 Numbered Steps -->

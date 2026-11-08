@@ -98,11 +98,11 @@ func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":                      "ok",
-			"bw_simplex_price_paise":    req.BWSimplexPricePaise,
-			"bw_duplex_price_paise":     req.BWDuplexPricePaise,
-			"color_simplex_price_paise": req.ColorSimplexPricePaise,
-			"color_duplex_price_paise":  req.ColorDuplexPricePaise,
-			"color_enabled":             req.ColorEnabled,
+			"bw_simplex_price_paise":      req.BWSimplexPricePaise,
+			"bw_duplex_price_paise":       req.BWDuplexPricePaise,
+			"color_simplex_price_paise":   req.ColorSimplexPricePaise,
+			"color_duplex_price_paise":    req.ColorDuplexPricePaise,
+			"color_enabled":               req.ColorEnabled,
 			"bw_price_per_sheet_paise":    req.BWSimplexPricePaise,
 			"color_price_per_sheet_paise": req.ColorSimplexPricePaise,
 		})

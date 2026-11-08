@@ -37,13 +37,14 @@ func (s *Store) rebind(query string) string {
 }
 
 type Order struct {
-	OrderID    string
-	Command    contracts.PrintJobCommand
-	Status     contracts.JobStatus
-	PricePaise int64
-	ColorMode  string // "BW" or "COLOR"
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	OrderID         string
+	Command         contracts.PrintJobCommand
+	Status          contracts.JobStatus
+	PricePaise      int64
+	ColorMode       string // "BW" or "COLOR"
+	OrderSecretHash string `json:"-"` // SHA256 hex hash of customer order secret (proof of order ownership, never serialized)
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // Open opens a database at dbPath. If dbPath starts with "postgres://" or "postgresql://",
@@ -181,6 +182,75 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS kiosks (
+    kiosk_id TEXT PRIMARY KEY,
+    secret_hash TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pickup_pins (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    pin_hmac TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    redeemed_at_ns BIGINT NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_pins_active_kiosk_hmac ON pickup_pins(kiosk_id, pin_hmac) WHERE status = 'ACTIVE';
+CREATE INDEX IF NOT EXISTS idx_pickup_pins_order ON pickup_pins(order_id);
+CREATE INDEX IF NOT EXISTS idx_pickup_pins_expires ON pickup_pins(expires_at_ns);
+CREATE INDEX IF NOT EXISTS idx_pickup_pins_kiosk_status ON pickup_pins(kiosk_id, status);
+
+CREATE TABLE IF NOT EXISTS payment_sessions (
+    session_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT,
+    kiosk_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_sessions_order ON payment_sessions(order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_sessions_kiosk ON payment_sessions(kiosk_id);
+
+CREATE TABLE IF NOT EXISTS payment_attempts (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES payment_sessions(session_id) ON DELETE RESTRICT,
+    kiosk_id TEXT NOT NULL,
+    payment_method TEXT NOT NULL,
+    razorpay_qr_id TEXT NOT NULL DEFAULT '',
+    razorpay_order_id TEXT NOT NULL DEFAULT '',
+    razorpay_payment_id TEXT NOT NULL DEFAULT '',
+    qr_image_url TEXT NOT NULL DEFAULT '',
+    amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
+    currency TEXT NOT NULL DEFAULT 'INR',
+    status TEXT NOT NULL DEFAULT 'CREATED',
+    error_reason TEXT NOT NULL DEFAULT '',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_attempts_qr_id ON payment_attempts(razorpay_qr_id) WHERE razorpay_qr_id != '';
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts(order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts(session_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_payment_id ON payment_attempts(razorpay_payment_id);
+
+CREATE TABLE IF NOT EXISTS payment_webhook_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload_hash TEXT NOT NULL DEFAULT '',
+    order_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'RECEIVED',
+    received_at_ns BIGINT NOT NULL,
+    processed_at_ns BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_payment_webhook_events_order ON payment_webhook_events(order_id);
 `
 		if _, err := db.Exec(schema); err != nil {
 			_ = db.Close()
@@ -188,6 +258,7 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 		}
 
 		pgMigrations := []string{
+			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_secret_hash TEXT NOT NULL DEFAULT '';",
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
@@ -199,6 +270,22 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
+			"CREATE TABLE IF NOT EXISTS kiosks (kiosk_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', is_active INTEGER NOT NULL DEFAULT 1, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
+			"CREATE TABLE IF NOT EXISTS pickup_pins (id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, pin_hmac TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE', created_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL, redeemed_at_ns BIGINT NOT NULL DEFAULT 0);",
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_pins_active_kiosk_hmac ON pickup_pins(kiosk_id, pin_hmac) WHERE status = 'ACTIVE';",
+			"CREATE INDEX IF NOT EXISTS idx_pickup_pins_order ON pickup_pins(order_id);",
+			"CREATE INDEX IF NOT EXISTS idx_pickup_pins_expires ON pickup_pins(expires_at_ns);",
+			"CREATE INDEX IF NOT EXISTS idx_pickup_pins_kiosk_status ON pickup_pins(kiosk_id, status);",
+			"CREATE TABLE IF NOT EXISTS payment_sessions (session_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT, kiosk_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE', created_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
+			"CREATE INDEX IF NOT EXISTS idx_payment_sessions_order ON payment_sessions(order_id);",
+			"CREATE INDEX IF NOT EXISTS idx_payment_sessions_kiosk ON payment_sessions(kiosk_id);",
+			"CREATE TABLE IF NOT EXISTS payment_attempts (id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT, session_id TEXT NOT NULL REFERENCES payment_sessions(session_id) ON DELETE RESTRICT, kiosk_id TEXT NOT NULL, payment_method TEXT NOT NULL, razorpay_qr_id TEXT NOT NULL DEFAULT '', razorpay_order_id TEXT NOT NULL DEFAULT '', razorpay_payment_id TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL CHECK (amount_paise > 0), currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL DEFAULT 'CREATED', error_reason TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_attempts_qr_id ON payment_attempts(razorpay_qr_id) WHERE razorpay_qr_id != '';",
+			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts(order_id);",
+			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts(session_id);",
+			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_payment_id ON payment_attempts(razorpay_payment_id);",
+			"CREATE TABLE IF NOT EXISTS payment_webhook_events (event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, payload_hash TEXT NOT NULL DEFAULT '', order_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'RECEIVED', received_at_ns BIGINT NOT NULL, processed_at_ns BIGINT NOT NULL DEFAULT 0);",
+			"CREATE INDEX IF NOT EXISTS idx_payment_webhook_events_order ON payment_webhook_events(order_id);",
 		}
 		for _, mig := range pgMigrations {
 			if _, err := db.Exec(mig); err != nil {
@@ -368,6 +455,75 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS kiosks (
+    kiosk_id TEXT PRIMARY KEY,
+    secret_hash TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pickup_pins (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    pin_hmac TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    redeemed_at_ns BIGINT NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_pins_active_kiosk_hmac ON pickup_pins(kiosk_id, pin_hmac) WHERE status = 'ACTIVE';
+CREATE INDEX IF NOT EXISTS idx_pickup_pins_order ON pickup_pins(order_id);
+CREATE INDEX IF NOT EXISTS idx_pickup_pins_expires ON pickup_pins(expires_at_ns);
+CREATE INDEX IF NOT EXISTS idx_pickup_pins_kiosk_status ON pickup_pins(kiosk_id, status);
+
+CREATE TABLE IF NOT EXISTS payment_sessions (
+    session_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT,
+    kiosk_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_sessions_order ON payment_sessions(order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_sessions_kiosk ON payment_sessions(kiosk_id);
+
+CREATE TABLE IF NOT EXISTS payment_attempts (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES payment_sessions(session_id) ON DELETE RESTRICT,
+    kiosk_id TEXT NOT NULL,
+    payment_method TEXT NOT NULL,
+    razorpay_qr_id TEXT NOT NULL DEFAULT '',
+    razorpay_order_id TEXT NOT NULL DEFAULT '',
+    razorpay_payment_id TEXT NOT NULL DEFAULT '',
+    qr_image_url TEXT NOT NULL DEFAULT '',
+    amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
+    currency TEXT NOT NULL DEFAULT 'INR',
+    status TEXT NOT NULL DEFAULT 'CREATED',
+    error_reason TEXT NOT NULL DEFAULT '',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_attempts_qr_id ON payment_attempts(razorpay_qr_id) WHERE razorpay_qr_id != '';
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts(order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts(session_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_payment_id ON payment_attempts(razorpay_payment_id);
+
+CREATE TABLE IF NOT EXISTS payment_webhook_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload_hash TEXT NOT NULL DEFAULT '',
+    order_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'RECEIVED',
+    received_at_ns BIGINT NOT NULL,
+    processed_at_ns BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_payment_webhook_events_order ON payment_webhook_events(order_id);
 `
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
@@ -383,6 +539,24 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 }
 
 func migrateSQLiteSchema(db *sql.DB) error {
+	colsOrders := make(map[string]bool)
+	rowsOrd, err := db.Query("PRAGMA table_info(orders);")
+	if err == nil {
+		for rowsOrd.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt *string
+			if err := rowsOrd.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+				colsOrders[name] = true
+			}
+		}
+		_ = rowsOrd.Close()
+	}
+	if !colsOrders["order_secret_hash"] {
+		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN order_secret_hash TEXT NOT NULL DEFAULT '';")
+	}
+
 	colsPricing := make(map[string]bool)
 	rows, err := db.Query("PRAGMA table_info(pricing);")
 	if err == nil {
@@ -437,8 +611,8 @@ func migrateSQLiteSchema(db *sql.DB) error {
 		_, _ = db.Exec("ALTER TABLE print_configs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
 	}
 
-	_, _ = db.Exec(`
-CREATE TABLE IF NOT EXISTS conversions (
+	sqliteMigrations := []string{
+		`CREATE TABLE IF NOT EXISTS conversions (
     id TEXT PRIMARY KEY,
     token TEXT NOT NULL,
     original_filename TEXT NOT NULL,
@@ -450,10 +624,81 @@ CREATE TABLE IF NOT EXISTS conversions (
     created_at_ns BIGINT NOT NULL,
     updated_at_ns BIGINT NOT NULL,
     expires_at_ns BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
-CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
-`)
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);`,
+		`CREATE TABLE IF NOT EXISTS kiosks (
+    kiosk_id TEXT PRIMARY KEY,
+    secret_hash TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);`,
+		`CREATE TABLE IF NOT EXISTS pickup_pins (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    pin_hmac TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    redeemed_at_ns BIGINT NOT NULL DEFAULT 0
+);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_pins_active_kiosk_hmac ON pickup_pins(kiosk_id, pin_hmac) WHERE status = 'ACTIVE';`,
+		`CREATE INDEX IF NOT EXISTS idx_pickup_pins_order ON pickup_pins(order_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_pickup_pins_expires ON pickup_pins(expires_at_ns);`,
+		`CREATE INDEX IF NOT EXISTS idx_pickup_pins_kiosk_status ON pickup_pins(kiosk_id, status);`,
+		`CREATE TABLE IF NOT EXISTS payment_sessions (
+    session_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT,
+    kiosk_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_sessions_order ON payment_sessions(order_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_sessions_kiosk ON payment_sessions(kiosk_id);`,
+		`CREATE TABLE IF NOT EXISTS payment_attempts (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES payment_sessions(session_id) ON DELETE RESTRICT,
+    kiosk_id TEXT NOT NULL,
+    payment_method TEXT NOT NULL,
+    razorpay_qr_id TEXT NOT NULL DEFAULT '',
+    razorpay_order_id TEXT NOT NULL DEFAULT '',
+    razorpay_payment_id TEXT NOT NULL DEFAULT '',
+    qr_image_url TEXT NOT NULL DEFAULT '',
+    amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
+    currency TEXT NOT NULL DEFAULT 'INR',
+    status TEXT NOT NULL DEFAULT 'CREATED',
+    error_reason TEXT NOT NULL DEFAULT '',
+    created_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_attempts_qr_id ON payment_attempts(razorpay_qr_id) WHERE razorpay_qr_id != '';`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts(order_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts(session_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_attempts_payment_id ON payment_attempts(razorpay_payment_id);`,
+		`CREATE TABLE IF NOT EXISTS payment_webhook_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload_hash TEXT NOT NULL DEFAULT '',
+    order_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'RECEIVED',
+    received_at_ns BIGINT NOT NULL,
+    processed_at_ns BIGINT NOT NULL DEFAULT 0
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_webhook_events_order ON payment_webhook_events(order_id);`,
+	}
+
+	for _, mig := range sqliteMigrations {
+		if _, err := db.Exec(mig); err != nil {
+			return fmt.Errorf("sqlite migration %s: %w", mig, err)
+		}
+	}
+
 	return nil
 }
 
@@ -540,8 +785,8 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx, s.rebind(`
-INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, created_at_ns, updated_at_ns)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, created_at_ns, updated_at_ns, order_secret_hash)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 `),
 		order.OrderID,
 		order.Command.JobID,
@@ -551,6 +796,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 		order.PricePaise,
 		createdNS,
 		updatedNS,
+		order.OrderSecretHash,
 	)
 	if err != nil {
 		return fmt.Errorf("create order: insert into orders: %w", err)
@@ -604,6 +850,7 @@ func (s *Store) GetOrder(ctx context.Context, orderID string) (*Order, error) {
 	query := `
 SELECT
     o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise, o.created_at_ns, o.updated_at_ns,
+    COALESCE(o.order_secret_hash, ''),
     p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page,
     COALESCE(p.color_mode, 'BW')
 FROM orders o
@@ -614,22 +861,23 @@ WHERE o.order_id = ?;
 	row := s.db.QueryRowContext(ctx, s.rebind(query), orderID)
 
 	var (
-		resOrderID    string
-		jobID         string
-		kioskID       string
-		displayCode   string
-		statusStr     string
-		pricePaise    int64
-		createdNS     int64
-		updatedNS     int64
-		downloadURL   string
-		sha256Check   string
-		totalPages    int
-		totalSheets   int
-		copies        int
-		duplexStr     string
-		startFromPage int
-		colorMode     string
+		resOrderID      string
+		jobID           string
+		kioskID         string
+		displayCode     string
+		statusStr       string
+		pricePaise      int64
+		createdNS       int64
+		updatedNS       int64
+		orderSecretHash string
+		downloadURL     string
+		sha256Check     string
+		totalPages      int
+		totalSheets     int
+		copies          int
+		duplexStr       string
+		startFromPage   int
+		colorMode       string
 	)
 
 	err := row.Scan(
@@ -641,6 +889,7 @@ WHERE o.order_id = ?;
 		&pricePaise,
 		&createdNS,
 		&updatedNS,
+		&orderSecretHash,
 		&downloadURL,
 		&sha256Check,
 		&totalPages,
@@ -671,11 +920,12 @@ WHERE o.order_id = ?;
 			Duplex:         contracts.DuplexMode(duplexStr),
 			StartFromPage:  startFromPage,
 		},
-		Status:     contracts.JobStatus(statusStr),
-		PricePaise: pricePaise,
-		ColorMode:  colorMode,
-		CreatedAt:  time.Unix(0, createdNS).UTC(),
-		UpdatedAt:  time.Unix(0, updatedNS).UTC(),
+		Status:          contracts.JobStatus(statusStr),
+		PricePaise:      pricePaise,
+		ColorMode:       colorMode,
+		OrderSecretHash: orderSecretHash,
+		CreatedAt:       time.Unix(0, createdNS).UTC(),
+		UpdatedAt:       time.Unix(0, updatedNS).UTC(),
 	}
 
 	return result, nil
@@ -704,8 +954,8 @@ func (s *Store) UpdateOrderStatus(ctx context.Context, orderID string, status co
 	res, err := s.db.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
-WHERE order_id = ?;
-`), string(status), updatedNS, orderID)
+WHERE order_id = ? OR job_id = ?;
+`), string(status), updatedNS, orderID, orderID)
 	if err != nil {
 		return fmt.Errorf("update order status: %w", err)
 	}
@@ -719,6 +969,88 @@ WHERE order_id = ?;
 	}
 
 	return nil
+}
+
+// GetPaidWaitingOrdersByKiosk queries all orders in PAID_WAITING status for the given kiosk.
+// This enables automatic offline recovery when a kiosk reconnects to the cloud hub.
+func (s *Store) GetPaidWaitingOrdersByKiosk(ctx context.Context, kioskID string) ([]contracts.PrintJobCommand, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("get paid waiting orders: store is closed or nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("get paid waiting orders: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("get paid waiting orders: %w", err)
+	}
+	cleanKiosk := strings.TrimSpace(kioskID)
+	if cleanKiosk == "" {
+		return nil, fmt.Errorf("get paid waiting orders: kioskID cannot be empty")
+	}
+
+	query := `
+SELECT
+    o.order_id, o.job_id, o.kiosk_id, o.display_code,
+    p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page
+FROM orders o
+JOIN print_configs p ON o.order_id = p.order_id
+WHERE o.kiosk_id = ? AND o.status = 'PAID_WAITING'
+ORDER BY o.created_at_ns ASC;
+`
+	rows, err := s.db.QueryContext(ctx, s.rebind(query), cleanKiosk)
+	if err != nil {
+		return nil, fmt.Errorf("query paid waiting orders for kiosk %s: %w", cleanKiosk, err)
+	}
+	defer rows.Close()
+
+	var commands []contracts.PrintJobCommand
+	for rows.Next() {
+		var (
+			orderID       string
+			jobID         string
+			kID           string
+			displayCode   string
+			downloadURL   string
+			sha256Check   string
+			totalPages    int
+			totalSheets   int
+			copies        int
+			duplexStr     string
+			startFromPage int
+		)
+		if err := rows.Scan(
+			&orderID,
+			&jobID,
+			&kID,
+			&displayCode,
+			&downloadURL,
+			&sha256Check,
+			&totalPages,
+			&totalSheets,
+			&copies,
+			&duplexStr,
+			&startFromPage,
+		); err != nil {
+			return nil, fmt.Errorf("scan paid waiting order: %w", err)
+		}
+
+		commands = append(commands, contracts.PrintJobCommand{
+			JobID:          jobID,
+			KioskID:        kID,
+			DisplayCode:    displayCode,
+			DownloadURL:    downloadURL,
+			SHA256Checksum: sha256Check,
+			TotalPages:     totalPages,
+			TotalSheets:    totalSheets,
+			Copies:         copies,
+			Duplex:         contracts.DuplexMode(duplexStr),
+			StartFromPage:  startFromPage,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate paid waiting orders: %w", err)
+	}
+	return commands, nil
 }
 
 // SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.

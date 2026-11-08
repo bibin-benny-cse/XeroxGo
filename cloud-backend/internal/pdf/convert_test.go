@@ -126,4 +126,3 @@ func TestConvertToPDF_TextAndImage(t *testing.T) {
 		t.Fatalf("expected passthrough PDF to match original size: %v", err)
 	}
 }
-

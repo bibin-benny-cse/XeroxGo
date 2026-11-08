@@ -108,15 +108,112 @@
 
   // Status & Tracking DOM
   const statusSection = document.getElementById('status-section');
+  const statusOrderId = document.getElementById('status-order-id');
+  const statusKioskName = document.getElementById('status-kiosk-name');
+  const statusPickupPin = document.getElementById('status-pickup-pin');
   const statusDisplayCode = document.getElementById('status-display-code');
+  const pinTimerBadge = document.getElementById('pin-timer-badge');
+  const pinCountdownText = document.getElementById('pin-countdown-text');
+  const btnRefreshPin = document.getElementById('btn-refresh-pin');
+  const pinRefreshError = document.getElementById('pin-refresh-error');
   const statusBadge = document.getElementById('status-badge');
   const statusProgressFill = document.getElementById('status-progress-fill');
   const statusPagesText = document.getElementById('status-pages-text');
   const statusSheetsText = document.getElementById('status-sheets-text');
   const statusErrorAlert = document.getElementById('status-error-alert');
-  const devSimulatePaymentBtn = document.getElementById('dev-simulate-payment-btn');
-  const upiPayButtonContainer = document.getElementById('upi-pay-container');
   const statusSuccessAlert = document.getElementById('status-success-alert');
+
+  // PIN Countdown & Refresh Timer
+  let pinCountdownTimer = null;
+
+  function stopPinCountdown() {
+    if (pinCountdownTimer) {
+      clearInterval(pinCountdownTimer);
+      pinCountdownTimer = null;
+    }
+  }
+
+  function startPinCountdown(expiresAtMs) {
+    stopPinCountdown();
+
+    function tick() {
+      const now = Date.now();
+      const remainingSec = Math.max(0, Math.floor((expiresAtMs - now) / 1000));
+      const mins = Math.floor(remainingSec / 60);
+      const secs = remainingSec % 60;
+      const formatted = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+
+      if (remainingSec > 0) {
+        if (pinCountdownText) pinCountdownText.textContent = `PIN valid for ${formatted}`;
+        if (pinTimerBadge) {
+          if (remainingSec <= 120) {
+            pinTimerBadge.className = 'pin-timer-badge expiring-soon';
+          } else {
+            pinTimerBadge.className = 'pin-timer-badge';
+          }
+        }
+      } else {
+        if (pinCountdownText) pinCountdownText.textContent = 'PIN Expired';
+        if (pinTimerBadge) pinTimerBadge.className = 'pin-timer-badge expired';
+        stopPinCountdown();
+      }
+    }
+
+    tick();
+    pinCountdownTimer = setInterval(tick, 1000);
+  }
+
+  if (btnRefreshPin) {
+    btnRefreshPin.addEventListener('click', async () => {
+      if (!activeOrderID) return;
+      let secret = '';
+      try {
+        secret = sessionStorage.getItem('xeroxgo_secret_' + activeOrderID) || '';
+      } catch (_) {}
+
+      if (!secret) {
+        if (pinRefreshError) {
+          pinRefreshError.textContent = 'Order ownership secret not found in session. Please upload your document again.';
+          pinRefreshError.classList.remove('hidden');
+        }
+        return;
+      }
+
+      btnRefreshPin.disabled = true;
+      if (pinRefreshError) pinRefreshError.classList.add('hidden');
+
+      try {
+        const resp = await fetch(`/api/orders/${encodeURIComponent(activeOrderID)}/pin/refresh`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ order_secret: secret })
+        });
+
+        const resData = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(resData.error || `Refresh failed (${resp.status})`);
+        }
+
+        const newPIN = String(resData.pickup_pin || '');
+        if (statusPickupPin) statusPickupPin.textContent = newPIN;
+        if (statusDisplayCode) statusDisplayCode.textContent = newPIN;
+
+        const expiresAtMs = (resData.pin_expires_at ? resData.pin_expires_at * 1000 : (Date.now() + (resData.pin_expires_in_seconds || 900) * 1000));
+        startPinCountdown(expiresAtMs);
+
+        if (pinRefreshError) pinRefreshError.classList.add('hidden');
+      } catch (err) {
+        if (pinRefreshError) {
+          pinRefreshError.textContent = err.message || 'Failed to refresh PIN. Please try again.';
+          pinRefreshError.classList.remove('hidden');
+        }
+      } finally {
+        btnRefreshPin.disabled = false;
+      }
+    });
+  }
 
   // Live Sheet Preview DOM
   const liveSheetContainer = document.getElementById('live-sheet-container');
@@ -1628,6 +1725,13 @@
       backendConfirmedPricePaise = data.total_price_paise;
       backendConfirmedOrderID = data.order_id;
 
+      // Securely store order_secret in sessionStorage only (never in URLs, logs, or persistent disk)
+      if (data.order_secret) {
+        try {
+          sessionStorage.setItem('xeroxgo_secret_' + data.order_id, data.order_secret);
+        } catch (_) {}
+      }
+
       // Update summary price with authoritative backend price
       if (summaryPrice) {
         summaryPrice.textContent = formatRupees(data.total_price_paise);
@@ -1641,50 +1745,21 @@
       if (filePreviewCard) filePreviewCard.classList.add('hidden');
       if (statusSection) statusSection.classList.remove('hidden');
 
-      statusDisplayCode.textContent = data.display_code || '----';
-      updateStatusDisplay(data.status, 0, data.total_pages, 0, data.total_sheets, '');
+      // Populate Order and Kiosk metadata
+      if (statusOrderId) statusOrderId.textContent = data.order_id || '-';
+      if (statusKioskName) statusKioskName.textContent = kioskID;
 
-      // Dev Mode payment button
-      if (devMode && devSimulatePaymentBtn) {
-        devSimulatePaymentBtn.classList.remove('hidden');
-        devSimulatePaymentBtn.onclick = async () => {
-          devSimulatePaymentBtn.disabled = true;
-          try {
-            const simResp = await fetch(`/api/orders/${encodeURIComponent(activeOrderID)}/simulate-payment`, {
-              method: 'POST'
-            });
-            if (!simResp.ok) {
-              const errData = await simResp.json().catch(() => ({}));
-              throw new Error(errData.error || 'Payment simulation failed');
-            }
-            const simData = await simResp.json();
-            updateStatusDisplay(simData.status, 0, data.total_pages, 0, data.total_sheets, '');
-          } catch (simErr) {
-            alert(simErr.message);
-            devSimulatePaymentBtn.disabled = false;
-          }
-        };
-      } else if (!devMode && typeof window.Razorpay === 'function') {
-        // Requirement 10 & 19: Razorpay order amount strictly matches confirmed backend order price in paise
-        try {
-          const rzp = new window.Razorpay({
-            key: container.dataset.razorpayKeyId || 'rzp_test_placeholder',
-            amount: data.total_price_paise,
-            currency: 'INR',
-            name: 'XeroxGo',
-            description: `Print Order (${data.display_code || data.order_id})`,
-            notes: {
-              order_id: data.order_id
-            },
-            handler: function() {
-              startPolling(activeOrderID);
-            }
-          });
-          rzp.open();
-        } catch (rzpErr) {
-          console.warn('Razorpay checkout initialization notice:', rzpErr);
-        }
-      }
+      // Display 4-digit pickup PIN preserving leading zeros
+      const initialPIN = String(data.pickup_pin || '----');
+      if (statusPickupPin) statusPickupPin.textContent = initialPIN;
+      if (statusDisplayCode) statusDisplayCode.textContent = initialPIN;
+
+      // Start 15-minute countdown timer based on server-provided expiry
+      const expiresAtMs = (data.pin_expires_at ? data.pin_expires_at * 1000 : (Date.now() + (data.pin_expires_in_seconds || 900) * 1000));
+      startPinCountdown(expiresAtMs);
+
+      // Initialize status display with friendly labels
+      updateStatusDisplay(data.status || 'PENDING_PAYMENT', 0, data.total_pages, 0, data.total_sheets, '');
 
       // Start live order status polling
       startPolling(activeOrderID);
@@ -1708,10 +1783,22 @@
     btnPayUpi.addEventListener('click', handleOrderSubmission);
   }
 
-  // --- Live Status Polling ---
+  // --- Live Status Polling & Customer-Friendly State Mapping ---
+  const statusLabels = {
+    'PENDING_PAYMENT': 'Pending Payment at Kiosk',
+    'PAID_WAITING': 'Payment Confirmed — Queued',
+    'DISPATCHED': 'Sent to Printer',
+    'SPOOLING': 'Spooling Document',
+    'PRINTING': 'Printing Document',
+    'COMPLETED': 'Print Completed',
+    'PAUSED_ERROR': 'Printer Paused / Error',
+    'FAILED_REFUNDABLE': 'Print Failed (Refundable)'
+  };
+
   function updateStatusDisplay(status, pagesPrinted, totalPages, sheetsPrinted, totalSheets, errReason) {
+    const friendlyLabel = statusLabels[status] || status;
     if (statusBadge) {
-      statusBadge.textContent = status;
+      statusBadge.textContent = friendlyLabel;
       statusBadge.className = `status-pill status-${status}`;
     }
 
@@ -1732,9 +1819,27 @@
       statusErrorAlert.classList.add('hidden');
     }
 
-    if (status === 'COMPLETED' && statusSuccessAlert) {
-      statusSuccessAlert.classList.remove('hidden');
-      if (devSimulatePaymentBtn) devSimulatePaymentBtn.classList.add('hidden');
+    // Disallow PIN refresh once order is paid or completed
+    const isPaidOrBeyond = (status === 'PAID_WAITING' || status === 'DISPATCHED' || status === 'SPOOLING' || status === 'PRINTING' || status === 'COMPLETED');
+    if (isPaidOrBeyond) {
+      if (btnRefreshPin) {
+        btnRefreshPin.disabled = true;
+        btnRefreshPin.title = 'Order paid - PIN is no longer required';
+      }
+      if (pinTimerBadge && status !== 'COMPLETED') {
+        pinTimerBadge.className = 'pin-timer-badge';
+        if (pinCountdownText) pinCountdownText.textContent = 'Payment Received';
+      }
+      stopPinCountdown();
+    }
+
+    if (status === 'COMPLETED') {
+      if (statusSuccessAlert) statusSuccessAlert.classList.remove('hidden');
+      stopPinCountdown();
+      if (pinTimerBadge) {
+        pinTimerBadge.className = 'pin-timer-badge';
+        if (pinCountdownText) pinCountdownText.textContent = 'Job Complete';
+      }
     }
   }
 
@@ -1755,10 +1860,8 @@
           data.error_reason
         );
 
-        if (data.status === 'COMPLETED' || data.status === 'PAUSED_ERROR' || data.status === 'FAILED_REFUNDABLE') {
-          if (data.status === 'COMPLETED') {
-            clearInterval(pollTimer);
-          }
+        if (data.status === 'COMPLETED') {
+          clearInterval(pollTimer);
         }
       } catch (_) {}
     }, 1200);

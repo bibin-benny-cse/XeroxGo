@@ -1454,3 +1454,117 @@ th {
   color: #DC2626;
   border: 1px solid #FECACA;
 }
+
+/* Stage 5: Pickup PIN Card & Timer Styles */
+.order-meta-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  background: #F8FAFC;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+}
+
+.pin-card-wrapper {
+  background: linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%);
+  border: 1.5px solid #E2E8F0;
+  border-radius: var(--radius-lg);
+  padding: 1.5rem 1rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.85rem;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+}
+
+.pin-label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+}
+
+.pin-display-large {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 2.75rem;
+  letter-spacing: 0.25em;
+  padding: 0.75rem 1.25rem;
+  background: #0F172A;
+  border-radius: var(--radius-md);
+  border: 2px solid var(--primary-color);
+  color: #38BDF8;
+  font-weight: 800;
+  text-shadow: 0 0 16px rgba(56, 189, 248, 0.45);
+  display: inline-block;
+  min-width: 220px;
+  text-align: center;
+  user-select: all;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
+}
+
+.pin-timer-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.85rem;
+  border-radius: 9999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background-color: #EFF6FF;
+  color: #1D4ED8;
+  border: 1px solid #BFDBFE;
+  transition: all var(--transition-fast);
+}
+
+.pin-timer-badge.expiring-soon {
+  background-color: #FEF3C7;
+  color: #B45309;
+  border-color: #FDE68A;
+}
+
+.pin-timer-badge.expired {
+  background-color: #FEE2E2;
+  color: #DC2626;
+  border-color: #FECACA;
+}
+
+.btn-refresh-pin {
+  margin-top: 0.25rem;
+  padding: 0.6rem 1.25rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--primary-color);
+  background: #FFFFFF;
+  color: var(--primary-color);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  transition: all var(--transition-fast);
+}
+
+.btn-refresh-pin:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.06);
+}
+
+.btn-refresh-pin:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+}
+
+.pin-instruction-text {
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  line-height: 1.45;
+  margin: 0;
+  max-width: 360px;
+}

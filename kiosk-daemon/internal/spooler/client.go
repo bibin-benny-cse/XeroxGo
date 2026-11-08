@@ -3,6 +3,8 @@ package spooler
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"xeroxgo/kiosk-daemon/internal/input"
 	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
@@ -40,6 +43,9 @@ type wireMessage struct {
 type ClientConfig struct {
 	CloudURL                 string
 	KioskID                  string
+	KioskSecret              string
+	BackendBaseURL           string
+	PaymentPollInterval      time.Duration
 	StateStore               *state.Store
 	PrinterAddr              string
 	SNMPTarget               string
@@ -55,6 +61,7 @@ type ClientConfig struct {
 	ErrorDisplayDuration     time.Duration
 	ScreenSink               ui_ipc.Sink
 	HTTPClient               *http.Client
+	RootCAPath               string
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
 }
@@ -64,6 +71,8 @@ type ClientConfig struct {
 type Client struct {
 	cfg           ClientConfig
 	normalizedURL string
+	workflow      *PaymentWorkflow
+	keypadCtrl    *input.Controller
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -95,6 +104,43 @@ type Client struct {
 	canvas   *image.RGBA
 
 	healthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+}
+
+// BuildTLSHTTPClient constructs an *http.Client enforcing TLS 1.2+ and standard certificate/hostname
+// verification. If rootCAPath is provided, it loads the specified CA certificates into the client trust pool;
+// otherwise, it uses the host system's trusted root CA pool. It strictly enforces standard verification
+// and NEVER sets InsecureSkipVerify to true.
+func BuildTLSHTTPClient(rootCAPath string, timeout time.Duration) (*http.Client, error) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		// Standard certificate and hostname verification are strictly enabled by default.
+		// InsecureSkipVerify is NEVER set to true.
+	}
+
+	if rootCAPath != "" {
+		pemData, err := os.ReadFile(rootCAPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read root CA certificate from %s: %w", rootCAPath, err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, fmt.Errorf("failed to parse PEM root CA certificate from %s", rootCAPath)
+		}
+		tlsConfig.RootCAs = pool
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Proxy:           http.ProxyFromEnvironment,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}, nil
 }
 
 // NewClient validates the configuration and initializes a new spooler client.
@@ -139,7 +185,18 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		rootCA := strings.TrimSpace(cfg.RootCAPath)
+		if rootCA == "" {
+			rootCA = strings.TrimSpace(os.Getenv("XEROXGO_CA_CERT"))
+		}
+		if rootCA == "" {
+			rootCA = strings.TrimSpace(os.Getenv("XEROXGO_ROOT_CA"))
+		}
+		builtClient, err := BuildTLSHTTPClient(rootCA, 60*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure TLS HTTP client: %w", err)
+		}
+		httpClient = builtClient
 	}
 	cfg.HTTPClient = httpClient
 
@@ -186,9 +243,25 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		ui_ipc.ConfigureAds(cached)
 	}
 
+	backendURL := strings.TrimSpace(cfg.BackendBaseURL)
+	if backendURL == "" {
+		scheme := "http"
+		if u.Scheme == "wss" {
+			scheme = "https"
+		}
+		backendURL = fmt.Sprintf("%s://%s", scheme, u.Host)
+	}
+	cfg.BackendBaseURL = backendURL
+
+	var wf *PaymentWorkflow
+	if strings.TrimSpace(cfg.KioskSecret) != "" {
+		wf, _ = NewPaymentWorkflow(cfg.BackendBaseURL, cfg.KioskID, cfg.KioskSecret, cfg.HTTPClient, cfg.PaymentPollInterval)
+	}
+
 	client := &Client{
 		cfg:               cfg,
 		normalizedURL:     normalizedURL,
+		workflow:          wf,
 		jobQueue:          make(chan contracts.PrintJobCommand, 16),
 		activeJobs:        make(map[string]bool),
 		minBackoff:        1 * time.Second,
@@ -198,9 +271,35 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		healthPoller:      poller,
 	}
 
+	client.keypadCtrl = input.NewController(input.Config{
+		OnChange: func(currentPIN string) {
+			_ = client.renderScreen(ui_ipc.ScreenState{
+				Mode:    ui_ipc.ModePINEntry,
+				PIN:     currentPIN,
+				Message: "Enter your 4-digit pickup PIN",
+			})
+		},
+		OnCancel: func() {
+			_ = client.renderScreen(ui_ipc.ScreenState{
+				Mode:      ui_ipc.ModeIdle,
+				QRContent: client.cfg.IdleQRContent,
+				Message:   "Ready to print",
+			})
+		},
+		OnSubmit: func(ctx context.Context, pin string) error {
+			session := NewKioskWorkflowSession(client)
+			return session.ExecuteWorkflow(ctx, pin)
+		},
+	})
+
 	go client.fetchInitialAds()
 
 	return client, nil
+}
+
+// Keypad returns the customer input controller for physical keypad, keyboard, or touchscreen interaction.
+func (c *Client) Keypad() *input.Controller {
+	return c.keypadCtrl
 }
 
 // Run executes the spooler client loops until the context is canceled.
@@ -221,17 +320,35 @@ func (c *Client) Run(ctx context.Context) error {
 		Message:   "Ready to print",
 	})
 
-	// 2. Startup recovery check
-	incomplete, err := c.cfg.StateStore.GetIncompleteJob(ctx)
+	// 2. Startup recovery check: handle interrupted PRINTING state safely
+	recoveryCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	incomplete, err := c.cfg.StateStore.GetIncompleteJob(recoveryCtx)
 	if err == nil && incomplete != nil {
-		c.activeMu.Lock()
-		c.activeJobs[incomplete.Command.JobID] = true
-		c.activeMu.Unlock()
-		select {
-		case c.jobQueue <- incomplete.Command:
-		default:
+		if incomplete.Status == contracts.JobStatusPrinting || incomplete.PagesPrinted > 0 {
+			// Job was interrupted mid-print! Do NOT automatically reprint an ambiguous job to avoid double printing.
+			log.Printf("[SPOOLER] Job %s was interrupted during PRINTING (%d pages printed). Marking PAUSED_ERROR to prevent ambiguous duplicate print.",
+				incomplete.Command.JobID, incomplete.PagesPrinted)
+			pauseEvt := contracts.JobProgressEvent{
+				JobID:         incomplete.Command.JobID,
+				KioskID:       incomplete.Command.KioskID,
+				Status:        contracts.JobStatusPausedError,
+				PagesPrinted:  incomplete.PagesPrinted,
+				SheetsPrinted: incomplete.SheetsPrinted,
+				ErrorReason:   "interrupted during printing: stopped to prevent ambiguous duplicate print",
+				Timestamp:     time.Now().UTC(),
+			}
+			_ = c.cfg.StateStore.UpdateProgress(recoveryCtx, pauseEvt)
+		} else {
+			c.activeMu.Lock()
+			c.activeJobs[incomplete.Command.JobID] = true
+			c.activeMu.Unlock()
+			select {
+			case c.jobQueue <- incomplete.Command:
+			default:
+			}
 		}
 	}
+	recCancel()
 
 	// 3. Start sequential job processing worker
 	var wg sync.WaitGroup
@@ -263,7 +380,10 @@ func (c *Client) Run(ctx context.Context) error {
 		default:
 		}
 
-		conn, _, err := websocket.Dial(ctx, c.normalizedURL, nil)
+		dialOpts := &websocket.DialOptions{
+			HTTPClient: c.cfg.HTTPClient,
+		}
+		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -401,12 +521,29 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 
 	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+
+	// 1. Simultaneous notification guard: if already in queue or processing, drop duplicate immediately
 	if c.activeJobs[cmd.JobID] {
-		c.activeMu.Unlock()
 		return
 	}
+
+	// 2. State store check: verify job hasn't completed or been interrupted previously
+	if c.cfg.StateStore != nil {
+		existingJob, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID)
+		if err == nil && existingJob != nil {
+			if existingJob.Status == contracts.JobStatusCompleted {
+				log.Printf("[SPOOLER] Job %s has already completed on kiosk %s; skipping duplicate print", cmd.JobID, c.cfg.KioskID)
+				return
+			}
+			if existingJob.Status == contracts.JobStatusPausedError && (existingJob.PagesPrinted > 0 || strings.Contains(existingJob.ErrorReason, "interrupted")) {
+				log.Printf("[SPOOLER] Job %s was previously interrupted (%d pages printed); skipping automatic reprint to avoid ambiguous duplicate", cmd.JobID, existingJob.PagesPrinted)
+				return
+			}
+		}
+	}
+
 	if len(c.activeJobs) > 0 {
-		c.activeMu.Unlock()
 		c.connMu.Lock()
 		conn := c.conn
 		c.connMu.Unlock()
@@ -419,16 +556,12 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		return
 	}
 	c.activeJobs[cmd.JobID] = true
-	c.activeMu.Unlock()
 	log.Printf("[SPOOLER] Queued print job %s (pages=%d, sheets=%d, copies=%d, duplex=%s)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets, cmd.Copies, cmd.Duplex)
 
 	select {
 	case c.jobQueue <- cmd:
 	default:
-		c.activeMu.Lock()
 		delete(c.activeJobs, cmd.JobID)
-		c.activeMu.Unlock()
-
 		c.connMu.Lock()
 		conn := c.conn
 		c.connMu.Unlock()
@@ -1063,3 +1196,48 @@ func loadAdsCache(path string) ([]contracts.AdItem, error) {
 	return ads, nil
 }
 
+// Workflow returns the configured PaymentWorkflow client.
+func (c *Client) Workflow() *PaymentWorkflow {
+	return c.workflow
+}
+
+// RedeemPIN submits a 4-digit pickup PIN to the backend using authenticated kiosk credentials.
+func (c *Client) RedeemPIN(ctx context.Context, pin string) (*PINRedeemResponse, error) {
+	if c.workflow == nil {
+		return nil, errors.New("payment workflow is not configured (missing kiosk secret)")
+	}
+	return c.workflow.RedeemPIN(ctx, pin)
+}
+
+// InitiatePaymentQR initiates a single-use Razorpay UPI QR code for the active payment session.
+func (c *Client) InitiatePaymentQR(ctx context.Context, sessionID string) (*PaymentQRResponse, error) {
+	if c.workflow == nil {
+		return nil, errors.New("payment workflow is not configured")
+	}
+	return c.workflow.InitiatePaymentQR(ctx, sessionID)
+}
+
+// GetPaymentStatus queries payment status for the session.
+func (c *Client) GetPaymentStatus(ctx context.Context, sessionID string) (*PaymentStatusResponse, error) {
+	if c.workflow == nil {
+		return nil, errors.New("payment workflow is not configured")
+	}
+	return c.workflow.GetPaymentStatus(ctx, sessionID)
+}
+
+// PollPaymentStatus polls until payment is confirmed or failed.
+func (c *Client) PollPaymentStatus(ctx context.Context, sessionID string, onUpdate func(*PaymentStatusResponse)) (*PaymentStatusResponse, error) {
+	if c.workflow == nil {
+		return nil, errors.New("payment workflow is not configured")
+	}
+	return c.workflow.PollPaymentStatus(ctx, sessionID, onUpdate)
+}
+
+// GetRenderHistory returns a thread-safe snapshot of all rendered screen states.
+func (c *Client) GetRenderHistory() []ui_ipc.ScreenState {
+	c.renderHistoryMu.Lock()
+	defer c.renderHistoryMu.Unlock()
+	copied := make([]ui_ipc.ScreenState, len(c.renderHistory))
+	copy(copied, c.renderHistory)
+	return copied
+}

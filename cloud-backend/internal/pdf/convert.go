@@ -183,4 +183,3 @@ func copyFile(src, dst string) error {
 	}
 	return out.Sync()
 }
-

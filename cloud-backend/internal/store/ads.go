@@ -436,4 +436,3 @@ func (s *Store) ReorderAds(ctx context.Context, orderedIDs []string) error {
 
 	return tx.Commit()
 }
-

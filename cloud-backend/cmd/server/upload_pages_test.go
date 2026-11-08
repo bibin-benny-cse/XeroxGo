@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"xeroxgo/cloud-backend/internal/pins"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -64,19 +65,22 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
+		addr:                  "localhost:0",
+		dbPath:                dbPath,
+		jobsDir:               jobsDir,
+		pricePerSheetPaise:    200,
+		downloadSecret:        []byte("test_secret_key_1234567890"),
+		pickupPINHMACSecret:   []byte("test_pickup_pin_hmac_secret_32_bytes_1234"),
+		maxActivePINsPerKiosk: 50,
 	}
 
 	hub := ws.NewHub(s)
 	app := &appServer{
-		cfg:      cfg,
-		db:       s,
-		hub:      hub,
-		convWake: make(chan struct{}, 10),
+		cfg:        cfg,
+		db:         s,
+		hub:        hub,
+		pinLimiter: pins.NewRateLimiter(pins.DefaultCooldownConfig()),
+		convWake:   make(chan struct{}, 10),
 	}
 
 	mux := http.NewServeMux()
@@ -116,7 +120,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantTotalCost: 1200, // 3 pages * 2 copies * 200 paise = 1200
 		},
 		{
-			name:          "duplex_3p_2copies_example_from_spec",
+			name: "duplex_3p_2copies_example_from_spec",
 			// Requirement 10: 3 pages * 2 copies in duplex = 6 printed sides, 4 physical sheets.
 			pdfPath:       doc3p,
 			copies:        "2",
@@ -484,4 +488,3 @@ func TestUpload_OfficeConvertedPDF_WithPageRange(t *testing.T) {
 		t.Errorf("total_sheets = %v, want 1", resp["total_sheets"])
 	}
 }
-

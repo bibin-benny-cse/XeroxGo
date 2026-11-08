@@ -13,15 +13,15 @@ import (
 // PricingConfig represents comprehensive pricing for monochrome and color prints (simplex and duplex)
 // along with hardware capabilities.
 type PricingConfig struct {
-	BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
-	BWDuplexPricePaise     int64     `json:"bw_duplex_price_paise"`
-	ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
-	ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
-	ColorEnabled           bool      `json:"color_enabled"`
+	BWSimplexPricePaise     int64     `json:"bw_simplex_price_paise"`
+	BWDuplexPricePaise      int64     `json:"bw_duplex_price_paise"`
+	ColorSimplexPricePaise  int64     `json:"color_simplex_price_paise"`
+	ColorDuplexPricePaise   int64     `json:"color_duplex_price_paise"`
+	ColorEnabled            bool      `json:"color_enabled"`
 	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
 	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
-	BWPricePerSidePaise    int64     `json:"bw_price_per_side_paise,omitempty"`
-	ColorPricePerSidePaise int64     `json:"color_price_per_side_paise,omitempty"`
+	BWPricePerSidePaise     int64     `json:"bw_price_per_side_paise,omitempty"`
+	ColorPricePerSidePaise  int64     `json:"color_price_per_side_paise,omitempty"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
@@ -84,15 +84,15 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 	}
 
 	return PricingConfig{
-		BWSimplexPricePaise:    bwSimplex,
-		BWDuplexPricePaise:     bwDuplex,
-		ColorSimplexPricePaise: colorSimplex,
-		ColorDuplexPricePaise:  colorDuplex,
-		ColorEnabled:           colorEnabledInt == 1,
+		BWSimplexPricePaise:     bwSimplex,
+		BWDuplexPricePaise:      bwDuplex,
+		ColorSimplexPricePaise:  colorSimplex,
+		ColorDuplexPricePaise:   colorDuplex,
+		ColorEnabled:            colorEnabledInt == 1,
 		BWPricePerSheetPaise:    bwSimplex,
 		ColorPricePerSheetPaise: colorSimplex,
-		BWPricePerSidePaise:    bwSimplex,
-		ColorPricePerSidePaise: colorSimplex,
+		BWPricePerSidePaise:     bwSimplex,
+		ColorPricePerSidePaise:  colorSimplex,
 		UpdatedAt:               time.Unix(0, updatedNS).UTC(),
 	}, nil
 }

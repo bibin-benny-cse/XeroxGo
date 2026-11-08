@@ -104,6 +104,15 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if activeAds, err := h.db.GetActiveAds(ctx); err == nil && len(activeAds) > 0 {
 			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: activeAds})
 		}
+
+		// Offline recovery: dispatch any pending PAID_WAITING jobs to this reconnected kiosk
+		if pendingJobs, err := h.db.GetPaidWaitingOrdersByKiosk(ctx, kioskID); err == nil && len(pendingJobs) > 0 {
+			for _, jobCmd := range pendingJobs {
+				log.Printf("[HUB] Dispatching pending paid job %s to reconnected kiosk %s", jobCmd.JobID, kioskID)
+				_ = wsjson.Write(ctx, conn, wireMessage{Type: "job", Job: &jobCmd})
+				_ = h.db.UpdateOrderStatus(ctx, jobCmd.JobID, contracts.JobStatusDispatched)
+			}
+		}
 	}
 
 	for {

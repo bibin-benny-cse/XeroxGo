@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"xeroxgo/cloud-backend/internal/pins"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -37,21 +38,24 @@ func setupPricingTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
 
 	webhookSecret := []byte("whsec_test_secret_32_characters_ok")
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
-		webhookSecret:      webhookSecret,
-		devMode:            true,
+		addr:                  "localhost:0",
+		dbPath:                dbPath,
+		jobsDir:               jobsDir,
+		pricePerSheetPaise:    200,
+		downloadSecret:        []byte("test_secret_key_1234567890"),
+		webhookSecret:         webhookSecret,
+		pickupPINHMACSecret:   []byte("test_pickup_pin_hmac_secret_32_bytes_1234"),
+		maxActivePINsPerKiosk: 50,
+		devMode:               true,
 	}
 
 	hub := ws.NewHub(s)
 	app := &appServer{
-		cfg:      cfg,
-		db:       s,
-		hub:      hub,
-		convWake: make(chan struct{}, 10),
+		cfg:        cfg,
+		db:         s,
+		hub:        hub,
+		pinLimiter: pins.NewRateLimiter(pins.DefaultCooldownConfig()),
+		convWake:   make(chan struct{}, 10),
 	}
 
 	mux := http.NewServeMux()

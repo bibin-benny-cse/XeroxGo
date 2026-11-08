@@ -27,12 +27,12 @@ RUN mkdir -p /data/jobs && chmod 700 /data/jobs
 
 COPY --from=builder /bin/xeroxgo-cloud /app/xeroxgo-cloud
 
-ENV PORT=8080 \
+ENV PORT=10000 \
     XEROXGO_CLOUD_DB=/data/xeroxgo-cloud.db \
     XEROXGO_JOBS_DIR=/data/jobs \
     XEROXGO_PRICE_PER_SHEET_PAISE=500 \
     XEROXGO_DEV_MODE=0
 
-EXPOSE 8080
+EXPOSE 10000
 
 ENTRYPOINT ["/app/xeroxgo-cloud"]

@@ -627,4 +627,3 @@ func setPixelClamped(dst *image.RGBA, x, y int, col color.RGBA) {
 		}
 	}
 }
-

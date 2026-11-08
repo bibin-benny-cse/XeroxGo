@@ -17,6 +17,13 @@ import (
 func createThreePageFixture(t *testing.T, dir string) string {
 	t.Helper()
 
+	if _, err := exec.LookPath("gs"); err != nil {
+		t.Skip("skipping test: ghostscript (gs) binary not found in PATH")
+	}
+	if _, err := exec.LookPath("qpdf"); err != nil {
+		t.Skip("skipping test: qpdf binary not found in PATH")
+	}
+
 	psPath := filepath.Join(dir, "fixture_3pages.ps")
 	pdfPath := filepath.Join(dir, "fixture_3pages.pdf")
 

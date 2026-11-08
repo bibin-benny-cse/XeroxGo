@@ -31,6 +31,10 @@ import (
 func createThreePageFixture(t *testing.T, dir string) (string, []byte, string) {
 	t.Helper()
 
+	if _, err := exec.LookPath("gs"); err != nil {
+		t.Skip("ghostscript (gs) not found in PATH; skipping test")
+	}
+
 	psPath := filepath.Join(dir, "fixture_3pages.ps")
 	pdfPath := filepath.Join(dir, "fixture_3pages.pdf")
 

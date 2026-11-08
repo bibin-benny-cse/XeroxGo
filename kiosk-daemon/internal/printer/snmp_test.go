@@ -423,13 +423,13 @@ func TestPollHealthErrorBitmask(t *testing.T) {
 
 func TestSupplyLevelCalculations(t *testing.T) {
 	tests := []struct {
-		name        string
-		tonerLevel  int
-		tonerMax    int
-		drumLevel   int
-		drumMax     int
-		wantToner   int
-		wantDrum    int
+		name       string
+		tonerLevel int
+		tonerMax   int
+		drumLevel  int
+		drumMax    int
+		wantToner  int
+		wantDrum   int
 	}{
 		{
 			name:       "normal_percentages",

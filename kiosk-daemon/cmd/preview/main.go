@@ -24,7 +24,7 @@ func main() {
 			name: "01_idle.png",
 			state: ui_ipc.ScreenState{
 				Mode:         ui_ipc.ModeIdle,
-				QRContent:    "https://xeroxgo.vercel.app",
+				QRContent:    "https://xeroxgo-frontend.vercel.app",
 				PrinterModel: "Brother DCP-T310",
 				AdSlideIndex: 0,
 			},
@@ -33,7 +33,7 @@ func main() {
 			name: "01_idle_slide2.png",
 			state: ui_ipc.ScreenState{
 				Mode:         ui_ipc.ModeIdle,
-				QRContent:    "https://xeroxgo.vercel.app",
+				QRContent:    "https://xeroxgo-frontend.vercel.app",
 				PrinterModel: "Brother DCP-T310",
 				AdSlideIndex: 1,
 			},
@@ -42,7 +42,7 @@ func main() {
 			name: "01_idle_slide3.png",
 			state: ui_ipc.ScreenState{
 				Mode:         ui_ipc.ModeIdle,
-				QRContent:    "https://xeroxgo.vercel.app",
+				QRContent:    "https://xeroxgo-frontend.vercel.app",
 				PrinterModel: "Brother DCP-T310",
 				AdSlideIndex: 2,
 			},
@@ -51,7 +51,7 @@ func main() {
 			name: "01_idle_transition.png",
 			state: ui_ipc.ScreenState{
 				Mode:           ui_ipc.ModeIdle,
-				QRContent:      "https://xeroxgo.vercel.app",
+				QRContent:      "https://xeroxgo-frontend.vercel.app",
 				PrinterModel:   "Brother DCP-T310",
 				AdSlideIndex:   1,
 				TransitionFrom: 0,
@@ -71,12 +71,12 @@ func main() {
 		{
 			name: "03_printing.png",
 			state: ui_ipc.ScreenState{
-				Mode:            ui_ipc.ModePrinting,
-				CurrentPage:     2,
-				TotalPages:      5,
-				Message:         "Please wait while your document prints...",
-				Detail:          "Job ID: xg-order-883921 • Duplex Simplex • 1 Copy",
-				PrinterModel:    "Brother DCP-T310",
+				Mode:         ui_ipc.ModePrinting,
+				CurrentPage:  2,
+				TotalPages:   5,
+				Message:      "Please wait while your document prints...",
+				Detail:       "Job ID: xg-order-883921 • Duplex Simplex • 1 Copy",
+				PrinterModel: "Brother DCP-T310",
 			},
 		},
 		{

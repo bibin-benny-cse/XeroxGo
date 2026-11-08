@@ -232,4 +232,3 @@ func TestUpdateAdminPasswordRevokesSessions(t *testing.T) {
 		t.Fatalf("new password should succeed")
 	}
 }
-

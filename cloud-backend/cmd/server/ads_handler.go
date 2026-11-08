@@ -515,4 +515,3 @@ func (app *appServer) handleServeAdImage(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
 	http.ServeFile(w, r, imagePath)
 }
-
