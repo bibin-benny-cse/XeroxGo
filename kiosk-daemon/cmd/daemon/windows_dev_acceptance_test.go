@@ -150,7 +150,10 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	// WebSocket Hub endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		kioskID := r.URL.Query().Get("kiosk_id")
+		t.Logf("[DIAG-TEST] Mock server /ws handler received request: Method=%s, RemoteAddr=%s, kiosk_id=%s",
+			r.Method, r.RemoteAddr, kioskID)
 		if kioskID != testKioskID {
+			t.Logf("[DIAG-TEST] Mock server /ws rejected request: expected kiosk_id=%s, got %s", testKioskID, kioskID)
 			http.Error(w, "missing or invalid kiosk_id", http.StatusBadRequest)
 			return
 		}
@@ -185,7 +188,6 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	tmpDir := t.TempDir()
 	stateDBPath := filepath.Join(tmpDir, "kiosk_state.db")
 	downloadDir := filepath.Join(tmpDir, "jobs")
-	previewPNG := filepath.Join(tmpDir, "dev_screen.png")
 
 	stateStore, err := state.Open(stateDBPath)
 	if err != nil {
@@ -196,8 +198,8 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	// 4. Initialize Dev Display Adapter (captures terminal output & PNG)
 	var terminalBuf bytes.Buffer
 	devDisplay, err := ui_ipc.NewDevDisplayAdapter(ui_ipc.DevDisplayConfig{
-		PreviewFile:   previewPNG,
-		WebPort:       0, // disabled in test
+		PreviewFile:   "", // Disabled in test to prevent disk I/O bottlenecks under race detection
+		WebPort:       0,  // disabled in test
 		ConsoleWriter: &terminalBuf,
 	})
 	if err != nil {
@@ -241,6 +243,7 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	}
 
 	// 7. Start Spooler in Background
+	t.Logf("[DIAG-TEST] Initializing Spooler in background, target wsURL=%s, backendURL=%s", wsURL, server.URL)
 	clientErrCh := make(chan error, 1)
 	go func() {
 		clientErrCh <- client.Run(ctx)
@@ -253,7 +256,11 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 			t.Fatalf("spooler client exited prematurely: %v", clientErr)
 		default:
 		}
-		return activeWSConn.Load() != nil
+		connected := activeWSConn.Load() != nil
+		if !connected {
+			t.Logf("[DIAG-TEST] requireCondition checking: activeWSConn is nil (acceptedCount=%d)", acceptedWSCount.Load())
+		}
+		return connected
 	}, "kiosk failed to connect to cloud WebSocket hub")
 
 	// Verify mock hub recorded the accepted connection

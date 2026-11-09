@@ -321,7 +321,9 @@ func (c *Client) Keypad() *input.Controller {
 
 // Run executes the spooler client loops until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
+	log.Printf("[DIAG-SPOOLER] Client.Run entered")
 	defer func() {
+		log.Printf("[DIAG-SPOOLER] Client.Run exiting")
 		c.idleMu.Lock()
 		if c.idleTimer != nil {
 			c.idleTimer.Stop()
@@ -330,16 +332,34 @@ func (c *Client) Run(ctx context.Context) error {
 		c.idleMu.Unlock()
 	}()
 
-	// 1. Initial idle screen transition
-	_ = c.renderScreen(ui_ipc.ScreenState{
-		Mode:      ui_ipc.ModeIdle,
-		QRContent: c.cfg.IdleQRContent,
-		Message:   "Ready to print",
-	})
+	var wg sync.WaitGroup
+
+	// 1. Initial idle screen transition (rendered asynchronously so screen rendering does not delay network connection)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		c.currentModeMu.Lock()
+		mode := c.currentMode
+		c.currentModeMu.Unlock()
+		if mode != "" && mode != ui_ipc.ModeIdle {
+			return
+		}
+		_ = c.renderScreen(ui_ipc.ScreenState{
+			Mode:      ui_ipc.ModeIdle,
+			QRContent: c.cfg.IdleQRContent,
+			Message:   "Ready to print",
+		})
+	}()
 
 	// 2. Startup recovery check: handle interrupted PRINTING state safely
-	recoveryCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	recoveryCtx, recCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	incomplete, err := c.cfg.StateStore.GetIncompleteJob(recoveryCtx)
+	log.Printf("[DIAG-SPOOLER] GetIncompleteJob completed (incomplete=%v, err=%v)", incomplete != nil, err)
 	if err == nil && incomplete != nil {
 		if incomplete.Status == contracts.JobStatusPrinting {
 			// Job was interrupted mid-print! Do NOT automatically reprint an ambiguous job to avoid double printing.
@@ -368,7 +388,7 @@ func (c *Client) Run(ctx context.Context) error {
 	recCancel()
 
 	// 3. Start sequential job processing worker
-	var wg sync.WaitGroup
+	log.Printf("[DIAG-SPOOLER] Starting jobWorker")
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -380,6 +400,7 @@ func (c *Client) Run(ctx context.Context) error {
 		c.cfg.IdleCarouselInterval = 5 * time.Second
 	}
 	if c.cfg.IdleCarouselInterval > 0 {
+		log.Printf("[DIAG-SPOOLER] Starting idleCarouselLoop")
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -388,10 +409,12 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 
 	// 4. Connection & reconnection loop
+	log.Printf("[DIAG-SPOOLER] Entering connection loop (minBackoff=%v, maxBackoff=%v, url=%s)", c.minBackoff, c.maxBackoff, c.normalizedURL)
 	delay := c.minBackoff
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[DIAG-SPOOLER] ctx.Done() triggered in connection loop: %v", ctx.Err())
 			wg.Wait()
 			return nil
 		default:
@@ -401,9 +424,13 @@ func (c *Client) Run(ctx context.Context) error {
 			HTTPClient: c.cfg.HTTPClient,
 		}
 		log.Printf("[SPOOLER] Attempting WebSocket dial to %s (delay=%v)...", c.normalizedURL, delay)
-		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
+		conn, resp, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
-			log.Printf("[SPOOLER] WebSocket dial failed for %s: %v", c.normalizedURL, err)
+			var respStatus string
+			if resp != nil {
+				respStatus = resp.Status
+			}
+			log.Printf("[SPOOLER] WebSocket dial failed for %s (status=%s): %v", c.normalizedURL, respStatus, err)
 			select {
 			case <-ctx.Done():
 				wg.Wait()
@@ -1010,6 +1037,9 @@ func (c *Client) downloadAndVerify(ctx context.Context, cmd contracts.PrintJobCo
 }
 
 func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
+	c.renderMu.Lock()
+	defer c.renderMu.Unlock()
+
 	if state.PrinterModel == "" && c.cfg.PrinterModel != "" {
 		state.PrinterModel = c.cfg.PrinterModel
 	}
@@ -1033,9 +1063,6 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 	if c.cfg.StateObserver != nil {
 		c.cfg.StateObserver(state)
 	}
-
-	c.renderMu.Lock()
-	defer c.renderMu.Unlock()
 
 	targetW, targetH := ui_ipc.GetTargetResolution()
 	if c.canvas == nil || c.canvas.Bounds().Dx() != targetW || c.canvas.Bounds().Dy() != targetH {

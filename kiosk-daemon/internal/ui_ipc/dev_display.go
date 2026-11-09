@@ -71,6 +71,13 @@ func NewDevDisplayAdapter(cfg DevDisplayConfig) (*DevDisplayAdapter, error) {
 	return adapter, nil
 }
 
+// encodeFastPNG encodes an image into PNG format using BestSpeed compression level.
+// A local png.Encoder value is used on each call to prevent shared mutable state across goroutines.
+func encodeFastPNG(w io.Writer, m image.Image) error {
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	return enc.Encode(w, m)
+}
+
 // Sink receives a rendered RGBA canvas, saves it to the preview PNG, and updates web bytes.
 func (a *DevDisplayAdapter) Sink(img *image.RGBA) error {
 	if img == nil {
@@ -78,7 +85,7 @@ func (a *DevDisplayAdapter) Sink(img *image.RGBA) error {
 	}
 
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	if err := encodeFastPNG(&buf, img); err != nil {
 		return fmt.Errorf("failed to encode PNG: %w", err)
 	}
 

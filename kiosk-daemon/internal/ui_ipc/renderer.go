@@ -1339,7 +1339,7 @@ func FilePreviewSink(pngPath string) Sink {
 			}
 		}()
 
-		if err := png.Encode(tmpFile, img); err != nil {
+		if err := encodeFastPNG(tmpFile, img); err != nil {
 			return fmt.Errorf("failed to encode PNG: %w", err)
 		}
 
