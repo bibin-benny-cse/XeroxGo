@@ -37,4 +37,4 @@ jobs:
           sudo apt-get install -y qpdf ghostscript libreoffice poppler-utils
 
       - name: Run verification gates
-        run: ./scripts/verify_gate.sh
+        run: bash ./scripts/verify_gate.sh

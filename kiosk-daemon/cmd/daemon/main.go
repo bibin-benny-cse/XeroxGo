@@ -1,25 +1,24 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"xeroxgo/kiosk-daemon/internal/input"
+	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/spooler"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
@@ -79,121 +78,7 @@ func startSystemdWatchdog(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func startMockPrinter(ctx context.Context, downloadDir string, wg *sync.WaitGroup) (string, func(), error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to bind mock printer: %w", err)
-	}
-
-	var closeOnce sync.Once
-	cleanup := func() {
-		closeOnce.Do(func() {
-			_ = ln.Close()
-		})
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go handleMockPrinterConn(conn, downloadDir)
-		}
-	}()
-
-	return ln.Addr().String(), cleanup, nil
-}
-
-func handleMockPrinterConn(conn net.Conn, downloadDir string) {
-	defer conn.Close()
-
-	var buf bytes.Buffer
-	const maxRead = 300 * 1024 * 1024 // 300 MiB safety bound
-	limited := io.LimitReader(conn, maxRead)
-	if _, err := io.Copy(&buf, limited); err != nil {
-		return
-	}
-
-	streamBytes := buf.Bytes()
-	headerMarker := []byte("@PJL ENTER LANGUAGE=PDF")
-	headerIdx := bytes.Index(streamBytes, headerMarker)
-	if headerIdx == -1 {
-		return
-	}
-
-	pdfStart := headerIdx + len(headerMarker)
-	if pdfStart < len(streamBytes) && streamBytes[pdfStart] == '\r' {
-		pdfStart++
-	}
-	if pdfStart < len(streamBytes) && streamBytes[pdfStart] == '\n' {
-		pdfStart++
-	}
-
-	trailerMarker := []byte("\x1b%-12345X@PJL EOJ")
-	trailerIdx := bytes.Index(streamBytes[pdfStart:], trailerMarker)
-	var pdfBytes []byte
-	if trailerIdx != -1 {
-		pdfBytes = streamBytes[pdfStart : pdfStart+trailerIdx]
-	} else {
-		pdfBytes = streamBytes[pdfStart:]
-	}
-
-	tmpFile, err := os.CreateTemp(downloadDir, "mock_printer_*.pdf")
-	if err != nil {
-		return
-	}
-	tmpName := tmpFile.Name()
-	defer func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpName)
-	}()
-
-	if _, err := tmpFile.Write(pdfBytes); err != nil {
-		return
-	}
-	_ = tmpFile.Close()
-
-	cmd := exec.Command("qpdf", "--show-npages", tmpName)
-	out, err := cmd.CombinedOutput()
-	pages := 1
-	if err == nil {
-		if p, perr := strconv.Atoi(strings.TrimSpace(string(out))); perr == nil && p > 0 {
-			pages = p
-		}
-	}
-
-	copies := 1
-	reCopies := regexp.MustCompile(`@PJL\s+SET\s+COPIES\s*=\s*(\d+)`)
-	if m := reCopies.FindSubmatch(streamBytes[:headerIdx]); len(m) > 1 {
-		if c, cerr := strconv.Atoi(string(m[1])); cerr == nil && c > 0 {
-			copies = c
-		}
-	}
-
-	isDuplex := bytes.Contains(streamBytes[:headerIdx], []byte("@PJL SET DUPLEX=ON"))
-
-	totalSheets := 0
-	if !isDuplex {
-		totalSheets = pages * copies
-	} else {
-		totalSheets = ((pages + 1) / 2) * copies
-	}
-	if totalSheets < 1 {
-		totalSheets = 1
-	}
-
-	for sheet := 1; sheet <= totalSheets; sheet++ {
-		time.Sleep(80 * time.Millisecond)
-		msg := fmt.Sprintf("@PJL USTATUS PAGE\r\n%d\r\n", sheet)
-		if _, werr := conn.Write([]byte(msg)); werr != nil {
-			return
-		}
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	_, _ = conn.Write([]byte("@PJL USTATUS JOB\r\nEND\r\n\f"))
+	return printer.StartDevPrinter(ctx, downloadDir, wg)
 }
 
 func suppressConsoleCursor() {
@@ -220,6 +105,8 @@ func restoreConsoleCursor() {
 }
 
 func main() {
+	devMode := flag.Bool("dev", runtime.GOOS == "windows", "Run in development mode (Windows-friendly defaults, terminal dashboard, simulated printer)")
+	devWebPort := flag.Int("dev-web-port", 8085, "Local HTTP port for development screen preview (0 to disable)")
 	mockPrinter := flag.Bool("mock-printer", false, "Run in mock printer mode on local loopback without physical device")
 	previewPNG := flag.String("preview-png", "", "Path to write preview PNG instead of writing to framebuffer")
 	cloudURL := flag.String("cloud-url", "ws://127.0.0.1:8080/ws", "Cloud WebSocket hub endpoint")
@@ -245,6 +132,22 @@ func main() {
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
 	caCert := flag.String("ca-cert", "", "Path to custom trusted CA certificate PEM file for TLS verification (defaults to XEROXGO_CA_CERT env)")
 	flag.Parse()
+
+	if *devMode {
+		ui_ipc.SetDevelopmentMode(true)
+		if *stateDB == "/var/kiosk/state.db" {
+			*stateDB = filepath.Join("data", "kiosk_state.db")
+		}
+		if *downloadDir == "/var/kiosk/jobs" {
+			*downloadDir = filepath.Join("data", "jobs")
+		}
+		if *adsCachePath == "/var/kiosk/ads_cache.json" {
+			*adsCachePath = filepath.Join("data", "ads_cache.json")
+		}
+		if !*mockPrinter && *printerAddr == "192.168.99.2:9100" && *cupsPrinter == "" {
+			*mockPrinter = true
+		}
+	}
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
 		*cupsPrinter = *cupsQueue
@@ -284,7 +187,26 @@ func main() {
 	defer stateStore.Close()
 
 	var screenSink ui_ipc.Sink
-	if *previewPNG != "" {
+	var stateObserver func(ui_ipc.ScreenState)
+	var devDisplay *ui_ipc.DevDisplayAdapter
+
+	if *devMode {
+		previewPath := *previewPNG
+		if previewPath == "" {
+			previewPath = filepath.Join("data", "dev_screen.png")
+		}
+		var err error
+		devDisplay, err = ui_ipc.NewDevDisplayAdapter(ui_ipc.DevDisplayConfig{
+			PreviewFile:   previewPath,
+			WebPort:       *devWebPort,
+			ConsoleWriter: os.Stdout,
+		})
+		if err != nil {
+			log.Fatalf("Fatal: failed to initialize dev display adapter: %v", err)
+		}
+		screenSink = devDisplay.Sink
+		stateObserver = devDisplay.ObserveState
+	} else if *previewPNG != "" {
 		if *screenRes != "" {
 			parts := strings.Split(*screenRes, "x")
 			if len(parts) == 2 {
@@ -341,23 +263,15 @@ func main() {
 	var cleanupMock func()
 
 	if *mockPrinter {
-		addr, cleanup, err := startMockPrinter(ctx, *downloadDir, &rootWg)
+		addr, cleanup, err := printer.StartDevPrinter(ctx, *downloadDir, &rootWg)
 		if err != nil {
 			log.Fatalf("Fatal: failed to start mock printer: %v", err)
 		}
 		cleanupMock = cleanup
 		actualPrinterAddr = addr
-		log.Printf("XeroxGo kiosk daemon: mock printer active on %s", actualPrinterAddr)
+		log.Printf("XeroxGo kiosk daemon: simulated printer active on %s (Emulating Brother HL-L5210DN)", actualPrinterAddr)
 
-		mockHealthPoller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
-				EstimatedSheets: estimatedSheets,
-				UpdatedAt:       time.Now().UTC(),
-			}
-		}
+		mockHealthPoller = printer.DevPrinterHealth
 	}
 
 	effectivePrinterModel := strings.TrimSpace(*printerModel)
@@ -431,6 +345,7 @@ func main() {
 		AdsCachePath:             *adsCachePath,
 		CompletedDisplayDuration: *completedTimeout,
 		ScreenSink:               screenSink,
+		StateObserver:            stateObserver,
 		HTTPClient:               nil,
 		RootCAPath:               strings.TrimSpace(*caCert),
 		MockHealth:               mockHealthPoller,
@@ -443,19 +358,44 @@ func main() {
 
 	keypad := client.Keypad()
 	if keypad != nil {
-		go func() {
-			_ = keypad.ReadLoop(ctx, os.Stdin)
-		}()
+		if *devMode {
+			devKeyboard := input.NewDevKeyboardAdapter(keypad, os.Stdin, os.Stdout)
+			go func() {
+				_ = devKeyboard.Run(ctx)
+			}()
+		} else {
+			go func() {
+				_ = keypad.ReadLoop(ctx, os.Stdin)
+			}()
+		}
 	}
 
-	startSystemdWatchdog(ctx, &rootWg)
-	_ = sendSystemdNotify("READY=1")
+	if !*devMode && runtime.GOOS != "windows" {
+		startSystemdWatchdog(ctx, &rootWg)
+		_ = sendSystemdNotify("READY=1")
+	}
 
 	targetDesc := actualPrinterAddr
 	if *cupsPrinter != "" {
 		targetDesc = "cups:" + *cupsPrinter
 	}
-	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s, model=%s)", *kioskID, *cloudURL, targetDesc, effectivePrinterModel)
+
+	if *devMode {
+		log.Printf("================================================================================")
+		log.Printf("         XEROXGO KIOSK DAEMON [DEVELOPMENT MODE (WINDOWS)] ACTIVE                ")
+		log.Printf("================================================================================")
+		log.Printf("  Kiosk ID:          %s", *kioskID)
+		log.Printf("  Cloud Hub:         %s", *cloudURL)
+		log.Printf("  Backend REST:      %s", effectiveBackendURL)
+		log.Printf("  Simulated Printer: %s", targetDesc)
+		if devDisplay != nil && devDisplay.WebAddr() != "" {
+			log.Printf("  Screen Preview:    http://%s", devDisplay.WebAddr())
+		}
+		log.Printf("  Keyboard Input:    Interactive stdin active (type 4-digit PINs, 'cancel')")
+		log.Printf("================================================================================")
+	} else {
+		log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s, model=%s)", *kioskID, *cloudURL, targetDesc, effectivePrinterModel)
+	}
 
 	if err := client.Run(ctx); err != nil {
 		log.Printf("spooler client exited with error: %v", err)
@@ -465,7 +405,12 @@ func main() {
 	if cleanupMock != nil {
 		cleanupMock()
 	}
+	if devDisplay != nil {
+		_ = devDisplay.Close()
+	}
 	rootWg.Wait()
-	restoreConsoleCursor()
+	if !*devMode && runtime.GOOS != "windows" {
+		restoreConsoleCursor()
+	}
 	log.Printf("XeroxGo kiosk daemon shut down cleanly.")
 }

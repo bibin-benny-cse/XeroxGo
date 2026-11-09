@@ -10,6 +10,7 @@ bin/
 dist/
 build/
 coverage/
+*.exe
 
 # Runtime state and generated files
 data/

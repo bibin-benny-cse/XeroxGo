@@ -73,27 +73,56 @@ type Sink func(*image.RGBA) error
 
 var (
 	// Frontend portal.css aligned palette
-	colorBgSlate         = color.RGBA{R: 248, G: 250, B: 252, A: 255} // #F8FAFC
-	colorCardBg          = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
-	colorBorder          = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
-	colorBorderDark      = color.RGBA{R: 203, G: 213, B: 225, A: 255} // #CBD5E1
-	colorPrimaryBlue     = color.RGBA{R: 37, G: 99, B: 235, A: 255}   // #2563EB
-	colorAccentBlue      = colorPrimaryBlue                           // Alias for tests
-	colorSuccessGreen    = color.RGBA{R: 16, G: 185, B: 129, A: 255}  // #10B981
-	colorWarningAmber    = color.RGBA{R: 245, G: 158, B: 11, A: 255}  // #F59E0B
-	colorErrorRed        = color.RGBA{R: 239, G: 68, B: 68, A: 255}   // #EF4444
-	colorTextPrimary     = color.RGBA{R: 30, G: 41, B: 59, A: 255}    // #1E293B
-	colorTextMutedDark   = color.RGBA{R: 51, G: 65, B: 85, A: 255}    // #334155 (Slate-700, dark gray)
-	colorTextSecondary   = color.RGBA{R: 100, G: 116, B: 139, A: 255} // #64748B
-	colorTextWhite       = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
-	colorBarBg           = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
-	colorPillBlueBg      = color.RGBA{R: 239, G: 246, B: 255, A: 255} // #EFF6FF
-	colorPillBlueBorder  = color.RGBA{R: 191, G: 219, B: 254, A: 255} // #BFDBFE
-	colorPillGreenBg     = color.RGBA{R: 236, G: 253, B: 245, A: 255} // #ECFDF5
-	colorPillGreenBorder = color.RGBA{R: 167, G: 243, B: 208, A: 255} // #A7F3D0
-	colorPillRedBg       = color.RGBA{R: 254, G: 242, B: 242, A: 255} // #FEF2F2
-	colorPillRedBorder   = color.RGBA{R: 254, G: 202, B: 202, A: 255} // #FECACA
+	colorBgSlate          = color.RGBA{R: 248, G: 250, B: 252, A: 255} // #F8FAFC
+	colorCardBg           = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
+	colorBorder           = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
+	colorBorderDark       = color.RGBA{R: 203, G: 213, B: 225, A: 255} // #CBD5E1
+	colorPrimaryBlue      = color.RGBA{R: 37, G: 99, B: 235, A: 255}   // #2563EB
+	colorAccentBlue       = colorPrimaryBlue                           // Alias for tests
+	colorSuccessGreen     = color.RGBA{R: 16, G: 185, B: 129, A: 255}  // #10B981
+	colorWarningAmber     = color.RGBA{R: 245, G: 158, B: 11, A: 255}  // #F59E0B
+	colorErrorRed         = color.RGBA{R: 239, G: 68, B: 68, A: 255}   // #EF4444
+	colorTextPrimary      = color.RGBA{R: 30, G: 41, B: 59, A: 255}    // #1E293B
+	colorTextMutedDark    = color.RGBA{R: 51, G: 65, B: 85, A: 255}    // #334155 (Slate-700, dark gray)
+	colorTextSecondary    = color.RGBA{R: 100, G: 116, B: 139, A: 255} // #64748B
+	colorTextWhite        = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
+	colorBarBg            = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
+	colorPillBlueBg       = color.RGBA{R: 239, G: 246, B: 255, A: 255} // #EFF6FF
+	colorPillBlueBorder   = color.RGBA{R: 191, G: 219, B: 254, A: 255} // #BFDBFE
+	colorPillGreenBg      = color.RGBA{R: 236, G: 253, B: 245, A: 255} // #ECFDF5
+	colorPillGreenBorder  = color.RGBA{R: 167, G: 243, B: 208, A: 255} // #A7F3D0
+	colorPillRedBg        = color.RGBA{R: 254, G: 242, B: 242, A: 255} // #FEF2F2
+	colorPillRedBorder    = color.RGBA{R: 254, G: 202, B: 202, A: 255} // #FECACA
+	colorPillAmberBg      = color.RGBA{R: 254, G: 243, B: 199, A: 255} // #FEF3C7
+	colorWarningAmberDark = color.RGBA{R: 180, G: 83, B: 9, A: 255}    // #B45309
 )
+
+var (
+	devModeMu sync.RWMutex
+	isDevMode bool
+)
+
+// SetDevelopmentMode enables or disables the development mode indicator banner across all kiosk screens.
+func SetDevelopmentMode(enabled bool) {
+	devModeMu.Lock()
+	defer devModeMu.Unlock()
+	isDevMode = enabled
+}
+
+// IsDevelopmentMode returns whether development mode is active.
+func IsDevelopmentMode() bool {
+	devModeMu.RLock()
+	defer devModeMu.RUnlock()
+	return isDevMode
+}
+
+func drawDevBadge(dst *image.RGBA) {
+	badge := image.Rect(1530, 32, 1860, 78)
+	drawPill(dst, badge, colorPillAmberBg, colorWarningAmber)
+	text := "DEV MODE (WINDOWS)"
+	w := measureTextWidth(faceBold18, text)
+	drawText(dst, faceBold18, text, badge.Min.X+(badge.Dx()-w)/2, badge.Min.Y+30, colorWarningAmberDark)
+}
 
 var renderMu sync.Mutex
 
@@ -179,6 +208,10 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 
 	// Subtitle beside brand logo
 	drawText(fullCanvas, faceReg22, "Upload, Print, Collect - It's that simple!", 480, 44, colorTextSecondary)
+
+	if IsDevelopmentMode() {
+		drawDevBadge(fullCanvas)
+	}
 
 	// 4. Mode-specific content
 	switch state.Mode {
@@ -538,6 +571,10 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 
 	// Subtitle beside brand logo
 	drawText(base, faceReg22, "Upload, Print, Collect - It's that simple!", 480, 44, colorTextSecondary)
+
+	if IsDevelopmentMode() {
+		drawDevBadge(base)
+	}
 
 	// 4. Right Card: QR Code + Onboarding Steps
 	rightCard := image.Rect(1280, 140, 1890, 1050)

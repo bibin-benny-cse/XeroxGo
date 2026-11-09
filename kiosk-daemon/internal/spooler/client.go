@@ -60,6 +60,7 @@ type ClientConfig struct {
 	CompletedDisplayDuration time.Duration
 	ErrorDisplayDuration     time.Duration
 	ScreenSink               ui_ipc.Sink
+	StateObserver            func(state ui_ipc.ScreenState)
 	HTTPClient               *http.Client
 	RootCAPath               string
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
@@ -1009,6 +1010,10 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 	c.currentModeMu.Lock()
 	c.currentMode = state.Mode
 	c.currentModeMu.Unlock()
+
+	if c.cfg.StateObserver != nil {
+		c.cfg.StateObserver(state)
+	}
 
 	c.renderMu.Lock()
 	defer c.renderMu.Unlock()
