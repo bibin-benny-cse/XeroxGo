@@ -56,6 +56,7 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	var isPaid atomic.Bool
 	var printJobDispatched atomic.Bool
 	var activeWSConn atomic.Pointer[websocket.Conn]
+	var acceptedWSCount atomic.Int32
 
 	// Create test QR PNG
 	qrImg := image.NewRGBA(image.Rect(0, 0, 100, 100))
@@ -148,17 +149,27 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 
 	// WebSocket Hub endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
+		kioskID := r.URL.Query().Get("kiosk_id")
+		if kioskID != testKioskID {
+			http.Error(w, "missing or invalid kiosk_id", http.StatusBadRequest)
 			return
 		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Logf("[MOCK HUB] Accept failed from %s: %v", r.RemoteAddr, err)
+			return
+		}
+		acceptedWSCount.Add(1)
 		activeWSConn.Store(conn)
-		defer activeWSConn.Store(nil)
-		defer conn.Close(websocket.StatusNormalClosure, "done")
+		defer func() {
+			activeWSConn.Store(nil)
+			_ = conn.Close(websocket.StatusNormalClosure, "done")
+		}()
+		t.Logf("[MOCK HUB] Accepted WebSocket connection #%d from %s (kiosk_id=%s)", acceptedWSCount.Load(), r.RemoteAddr, kioskID)
 
 		for {
 			var msg map[string]interface{}
-			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+			if err := wsjson.Read(ctx, conn, &msg); err != nil {
 				return
 			}
 		}
@@ -208,6 +219,10 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 		KioskID:                  testKioskID,
 		KioskSecret:              testKioskSecret,
 		BackendBaseURL:           server.URL,
+		HTTPClient:               server.Client(),
+		MinBackoff:               20 * time.Millisecond,
+		MaxBackoff:               100 * time.Millisecond,
+		HeartbeatInterval:        100 * time.Millisecond,
 		PaymentPollInterval:      100 * time.Millisecond,
 		StateStore:               stateStore,
 		PrinterAddr:              printerAddr,
@@ -233,8 +248,18 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 
 	// Wait for WebSocket connection to establish
 	requireCondition(t, 5*time.Second, func() bool {
+		select {
+		case clientErr := <-clientErrCh:
+			t.Fatalf("spooler client exited prematurely: %v", clientErr)
+		default:
+		}
 		return activeWSConn.Load() != nil
 	}, "kiosk failed to connect to cloud WebSocket hub")
+
+	// Verify mock hub recorded the accepted connection
+	if count := acceptedWSCount.Load(); count < 1 {
+		t.Fatalf("expected mock hub to accept at least 1 kiosk connection, got %d", count)
+	}
 
 	// 8. Test Keyboard Input: Customer types PIN '0482'
 	keypadCtrl := client.Keypad()

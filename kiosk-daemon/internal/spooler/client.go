@@ -63,6 +63,9 @@ type ClientConfig struct {
 	StateObserver            func(state ui_ipc.ScreenState)
 	HTTPClient               *http.Client
 	RootCAPath               string
+	MinBackoff               time.Duration
+	MaxBackoff               time.Duration
+	HeartbeatInterval        time.Duration
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
 }
@@ -259,15 +262,28 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		wf, _ = NewPaymentWorkflow(cfg.BackendBaseURL, cfg.KioskID, cfg.KioskSecret, cfg.HTTPClient, cfg.PaymentPollInterval)
 	}
 
+	minBackoff := cfg.MinBackoff
+	if minBackoff <= 0 {
+		minBackoff = 1 * time.Second
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+	hbInterval := cfg.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = 15 * time.Second
+	}
+
 	client := &Client{
 		cfg:               cfg,
 		normalizedURL:     normalizedURL,
 		workflow:          wf,
 		jobQueue:          make(chan contracts.PrintJobCommand, 16),
 		activeJobs:        make(map[string]bool),
-		minBackoff:        1 * time.Second,
-		maxBackoff:        30 * time.Second,
-		heartbeatInterval: 15 * time.Second,
+		minBackoff:        minBackoff,
+		maxBackoff:        maxBackoff,
+		heartbeatInterval: hbInterval,
 		maxDownloadBytes:  250 * 1024 * 1024,
 		healthPoller:      poller,
 	}
@@ -384,8 +400,10 @@ func (c *Client) Run(ctx context.Context) error {
 		dialOpts := &websocket.DialOptions{
 			HTTPClient: c.cfg.HTTPClient,
 		}
+		log.Printf("[SPOOLER] Attempting WebSocket dial to %s (delay=%v)...", c.normalizedURL, delay)
 		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
+			log.Printf("[SPOOLER] WebSocket dial failed for %s: %v", c.normalizedURL, err)
 			select {
 			case <-ctx.Done():
 				wg.Wait()
@@ -399,6 +417,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 		}
 
+		log.Printf("[SPOOLER] WebSocket connected successfully to %s", c.normalizedURL)
 		// Connected successfully: reset backoff delay
 		delay = c.minBackoff
 		c.handleConnection(ctx, conn)
