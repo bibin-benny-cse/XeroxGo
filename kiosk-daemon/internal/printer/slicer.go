@@ -3,6 +3,7 @@ package printer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -164,6 +165,11 @@ func runQpdfCommand(ctx context.Context, args ...string) (string, error) {
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 3 {
+			// Exit code 3 is warnings-only; operation succeeded
+			return stdout.String(), nil
 		}
 		var diags []string
 		if outStr := strings.TrimSpace(stdout.String()); outStr != "" {

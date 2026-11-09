@@ -319,6 +319,7 @@ func TestPricing_PreservesAgreedPriceWhenAdminPricingChanges(t *testing.T) {
 
 // Requirement 10 & 19: Verify the actual Razorpay order amount equals the displayed and stored amount in paise.
 func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
+	ensureToolingEnvironment(t)
 	app, mux, webhookSecret := setupPricingTestServer(t)
 	tmpDir := t.TempDir()
 
@@ -327,12 +328,22 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 		t.Fatalf("SetDetailedPricing failed: %v", err)
 	}
 
-	// Create order for 3 pages simplex = 600 paise
+	// Create order for 3 pages simplex
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
 	resp := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "")
 	orderID := resp["order_id"].(string)
 
-	// Scenario A: Razorpay webhook with TAMPERED amount (300 paise instead of 600 paise)
+	orderBefore, err := app.db.GetOrder(ctx, orderID)
+	if err != nil {
+		t.Fatalf("GetOrder failed: %v", err)
+	}
+	expectedAmount := orderBefore.PricePaise
+	tamperedAmount := expectedAmount / 2
+	if tamperedAmount == expectedAmount {
+		tamperedAmount = expectedAmount - 1
+	}
+
+	// Scenario A: Razorpay webhook with TAMPERED amount
 	mismatchPayload := []byte(fmt.Sprintf(`{
 		"event": "payment.captured",
 		"payload": {
@@ -340,17 +351,19 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 				"entity": {
 					"id": "pay_tampered_123",
 					"order_id": "%s",
-					"amount": 300,
+					"amount": %d,
+					"currency": "INR",
 					"status": "captured",
 					"notes": { "order_id": "%s" }
 				}
 			}
 		}
-	}`, orderID, orderID))
+	}`, orderID, tamperedAmount, orderID))
 
 	sigMismatch := signRazorpayPayload(mismatchPayload, webhookSecret)
 	reqMismatch := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", bytes.NewReader(mismatchPayload))
 	reqMismatch.Header.Set("X-Razorpay-Signature", sigMismatch)
+	reqMismatch.Header.Set("X-Razorpay-Event-Id", "evt_mismatch_123")
 	rrMismatch := httptest.NewRecorder()
 	mux.ServeHTTP(rrMismatch, reqMismatch)
 
@@ -364,7 +377,7 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 		t.Errorf("order status after underpaid webhook = %v, want %v", order.Status, contracts.JobStatusPendingPayment)
 	}
 
-	// Scenario B: Razorpay webhook with EXACT matching amount (600 paise)
+	// Scenario B: Razorpay webhook with EXACT matching amount
 	exactPayload := []byte(fmt.Sprintf(`{
 		"event": "payment.captured",
 		"payload": {
@@ -372,17 +385,19 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 				"entity": {
 					"id": "pay_exact_456",
 					"order_id": "%s",
-					"amount": 600,
+					"amount": %d,
+					"currency": "INR",
 					"status": "captured",
 					"notes": { "order_id": "%s" }
 				}
 			}
 		}
-	}`, orderID, orderID))
+	}`, orderID, expectedAmount, orderID))
 
 	sigExact := signRazorpayPayload(exactPayload, webhookSecret)
 	reqExact := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", bytes.NewReader(exactPayload))
 	reqExact.Header.Set("X-Razorpay-Signature", sigExact)
+	reqExact.Header.Set("X-Razorpay-Event-Id", "evt_exact_456")
 	rrExact := httptest.NewRecorder()
 	mux.ServeHTTP(rrExact, reqExact)
 

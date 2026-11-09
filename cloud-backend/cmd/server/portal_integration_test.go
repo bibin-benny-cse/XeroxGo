@@ -120,15 +120,20 @@ func main() {
 			inFile = arg
 		}
 	}
-	if outFile != "" && inFile != "" && outFile != inFile {
-		in, err := os.Open(inFile)
-		if err == nil {
-			defer in.Close()
-			out, err := os.Create(outFile)
-			if err == nil {
-				defer out.Close()
-				_, _ = io.Copy(out, in)
+	if outFile != "" {
+		written := false
+		if inFile != "" && outFile != inFile {
+			if in, err := os.Open(inFile); err == nil {
+				if out, err := os.Create(outFile); err == nil {
+					_, _ = io.Copy(out, in)
+					_ = out.Close()
+					written = true
+				}
+				_ = in.Close()
 			}
+		}
+		if !written {
+			_ = os.WriteFile(outFile, []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"), 0644)
 		}
 	}
 	os.Exit(0)

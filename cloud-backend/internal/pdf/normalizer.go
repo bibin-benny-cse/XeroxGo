@@ -141,6 +141,13 @@ func ExtractPageRange(ctx context.Context, inputPath, outputPath string, pages [
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 3 {
+			// Exit code 3 is warnings-only; verify output file was created and is non-empty
+			if stat, statErr := os.Stat(outputPath); statErr == nil && stat.Size() > 0 {
+				return nil
+			}
+		}
 		return fmt.Errorf("qpdf page extraction failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
@@ -272,16 +279,22 @@ func NormalizeAndCountWithOptions(
 
 	// Step 3: Count raw pages of input PDF
 	cmdRawPages := exec.CommandContext(ctx, "qpdf", "--show-npages", inputPath)
-	outRawPages, errRawPages := cmdRawPages.CombinedOutput()
-	if errRawPages != nil {
+	var stdoutRawPages, stderrRawPages strings.Builder
+	cmdRawPages.Stdout = &stdoutRawPages
+	cmdRawPages.Stderr = &stderrRawPages
+	if errRawPages := cmdRawPages.Run(); errRawPages != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("failed to count pages of input PDF: %s: %w", strings.TrimSpace(string(outRawPages)), errRawPages)
+		var exitErr *exec.ExitError
+		if !errors.As(errRawPages, &exitErr) || exitErr.ExitCode() != 3 {
+			return nil, fmt.Errorf("failed to count pages of input PDF: %s: %w", strings.TrimSpace(stderrRawPages.String()), errRawPages)
+		}
+		// Exit code 3 is warnings-only; accepted per specification
 	}
-	rawTotalPages, err := strconv.Atoi(strings.TrimSpace(string(outRawPages)))
+	rawTotalPages, err := strconv.Atoi(strings.TrimSpace(stdoutRawPages.String()))
 	if err != nil || rawTotalPages <= 0 {
-		return nil, fmt.Errorf("invalid raw page count %q: %w", strings.TrimSpace(string(outRawPages)), err)
+		return nil, fmt.Errorf("invalid raw page count %q: %w", strings.TrimSpace(stdoutRawPages.String()), err)
 	}
 
 	// Step 4: Handle page range selection
@@ -372,7 +385,11 @@ func NormalizeAndCountWithOptions(
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("qpdf --show-npages failed: %s: %w", strings.TrimSpace(stderrPages.String()), err)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+			return nil, fmt.Errorf("qpdf --show-npages failed: %s: %w", strings.TrimSpace(stderrPages.String()), err)
+		}
+		// Exit code 3 is warnings-only; accepted per specification
 	}
 
 	actualOutputPages, err := strconv.Atoi(strings.TrimSpace(stdoutPages.String()))

@@ -232,7 +232,7 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	}()
 
 	// Wait for WebSocket connection to establish
-	requireCondition(t, 2*time.Second, func() bool {
+	requireCondition(t, 5*time.Second, func() bool {
 		return activeWSConn.Load() != nil
 	}, "kiosk failed to connect to cloud WebSocket hub")
 

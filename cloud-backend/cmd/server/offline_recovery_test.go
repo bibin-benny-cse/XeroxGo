@@ -155,13 +155,23 @@ func TestOfflineRecovery_KioskReconnectReceivesPaidJobExactlyOnce(t *testing.T) 
 		t.Fatalf("received job ID mismatch: got %s, want %s", receivedJob.JobID, jobID)
 	}
 
-	// Verify order status on backend was updated to DISPATCHED
-	afterDispatch, err := app.db.GetOrder(ctx, orderID)
-	if err != nil {
-		t.Fatalf("GetOrder after dispatch failed: %v", err)
+	// Verify order status on backend was updated to DISPATCHED (poll briefly for async SQLite write in hub goroutine)
+	var afterDispatch *store.Order
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ord, err := app.db.GetOrder(ctx, orderID)
+		if err == nil && ord.Status == contracts.JobStatusDispatched {
+			afterDispatch = ord
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if afterDispatch.Status != contracts.JobStatusDispatched {
-		t.Fatalf("expected order status DISPATCHED, got %s", afterDispatch.Status)
+	if afterDispatch == nil {
+		ord, err := app.db.GetOrder(ctx, orderID)
+		if err != nil {
+			t.Fatalf("GetOrder after dispatch failed: %v", err)
+		}
+		t.Fatalf("expected order status DISPATCHED, got %s", ord.Status)
 	}
 
 	// 7. Kiosk executes job and sends COMPLETED progress event

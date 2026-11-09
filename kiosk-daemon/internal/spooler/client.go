@@ -325,7 +325,7 @@ func (c *Client) Run(ctx context.Context) error {
 	recoveryCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	incomplete, err := c.cfg.StateStore.GetIncompleteJob(recoveryCtx)
 	if err == nil && incomplete != nil {
-		if incomplete.Status == contracts.JobStatusPrinting || incomplete.PagesPrinted > 0 {
+		if incomplete.Status == contracts.JobStatusPrinting {
 			// Job was interrupted mid-print! Do NOT automatically reprint an ambiguous job to avoid double printing.
 			log.Printf("[SPOOLER] Job %s was interrupted during PRINTING (%d pages printed). Marking PAUSED_ERROR to prevent ambiguous duplicate print.",
 				incomplete.Command.JobID, incomplete.PagesPrinted)

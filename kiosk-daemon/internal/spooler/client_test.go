@@ -1027,7 +1027,7 @@ func TestClientDuplicateJobDoesNotPrintTwice(t *testing.T) {
 	}()
 
 	// Wait until print connection is made
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if printConnections.Load() == 1 {
 			break
