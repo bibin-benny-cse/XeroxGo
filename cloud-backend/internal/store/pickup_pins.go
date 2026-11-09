@@ -364,7 +364,17 @@ WHERE id = ? AND status = 'ACTIVE';
 		return nil, ErrPINAlreadyRedeemed
 	}
 
-	// 4. Create separate payment session bound to machine & order with its own expiry
+	// 4. Invalidate any existing active sessions for this order to ensure only one active session exists
+	_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE payment_sessions
+SET status = 'EXPIRED'
+WHERE order_id = ? AND status = 'ACTIVE';
+`), orderID)
+	if err != nil {
+		return nil, fmt.Errorf("redeem pickup pin: expire previous payment sessions: %w", err)
+	}
+
+	// 5. Create separate payment session bound to machine & order with its own expiry
 	_, err = tx.ExecContext(ctx, s.rebind(`
 INSERT INTO payment_sessions (session_id, order_id, kiosk_id, status, created_at_ns, expires_at_ns)
 VALUES (?, ?, ?, 'ACTIVE', ?, ?);
@@ -520,7 +530,17 @@ WHERE order_id = ? AND status IN ('ACTIVE', 'EXPIRED');
 		return fmt.Errorf("refresh order pickup pin: supersede old pins: %w", err)
 	}
 
-	// 4. Create new pickup PIN
+	// 4. Invalidate any existing active payment sessions for this order
+	_, err = s.db.ExecContext(ctx, s.rebind(`
+UPDATE payment_sessions
+SET status = 'EXPIRED'
+WHERE order_id = ? AND status = 'ACTIVE';
+`), orderID)
+	if err != nil {
+		return fmt.Errorf("refresh order pickup pin: expire previous payment sessions: %w", err)
+	}
+
+	// 5. Create new pickup PIN
 	return s.CreatePickupPIN(ctx, newPIN, maxActivePerKiosk)
 }
 
@@ -746,6 +766,29 @@ func (s *Store) UpdatePaymentSessionStatus(ctx context.Context, sessionID string
 	rows, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("update payment session status: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
+// UpdatePaymentSessionExpiry updates a payment session expiry timestamp.
+func (s *Store) UpdatePaymentSessionExpiry(ctx context.Context, sessionID string, expiresAt time.Time) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("update payment session expiry: store is closed or nil")
+	}
+	if ctx == nil {
+		return fmt.Errorf("update payment session expiry: context is nil")
+	}
+
+	res, err := s.db.ExecContext(ctx, s.rebind(`UPDATE payment_sessions SET expires_at_ns = ? WHERE session_id = ?;`), expiresAt.UTC().UnixNano(), sessionID)
+	if err != nil {
+		return fmt.Errorf("update payment session expiry: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update payment session expiry: rows affected: %w", err)
 	}
 	if rows == 0 {
 		return ErrSessionNotFound

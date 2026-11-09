@@ -391,12 +391,19 @@ func (s *KioskWorkflowSession) ExecuteWorkflow(ctx context.Context, pin string) 
 	// 3. Initiate Payment QR
 	qrResp, err := s.workflow.InitiatePaymentQR(ctx, s.sessionID)
 	if err != nil {
+		canRetry := true
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "insufficient remaining lifetime") ||
+			strings.Contains(errStr, "expired") ||
+			strings.Contains(errStr, "not found") {
+			canRetry = false
+		}
 		_ = s.client.renderScreen(ui_ipc.ScreenState{
 			Mode:            ui_ipc.ModePaymentFailed,
 			OrderID:         s.orderID,
 			AmountPaise:     s.pricePaise,
 			PaymentError:    err.Error(),
-			CanRetryPayment: true,
+			CanRetryPayment: canRetry,
 		})
 		return err
 	}

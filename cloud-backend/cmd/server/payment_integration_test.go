@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"image/png"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -32,6 +33,13 @@ type mockRazorpayClient struct {
 	createLinkFn   func(ctx context.Context, req payments.CreatePaymentLinkRequest) (*payments.PaymentLinkResponse, error)
 	fetchPaymentFn func(ctx context.Context, paymentID string) (*payments.PaymentEntity, error)
 	callCount      int
+	lastLinkReq    payments.CreatePaymentLinkRequest
+}
+
+func (m *mockRazorpayClient) getLastLinkReq() payments.CreatePaymentLinkRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastLinkReq
 }
 
 func (m *mockRazorpayClient) CreateUPIQRCode(ctx context.Context, req payments.CreateQRCodeRequest) (*payments.QRCodeResponse, error) {
@@ -57,6 +65,7 @@ func (m *mockRazorpayClient) CreatePaymentLink(ctx context.Context, req payments
 	m.mu.Lock()
 	m.callCount++
 	count := m.callCount
+	m.lastLinkReq = req
 	m.mu.Unlock()
 
 	if m.createLinkFn != nil {
@@ -469,6 +478,621 @@ func TestKioskInitiateQR_ProviderFailureDoesNotCreateBogusAttempt(t *testing.T) 
 	}
 	if attempt != nil {
 		t.Errorf("expected no attempt created on provider failure, got %+v", attempt)
+	}
+}
+
+func createOrderAndSessionWithExpiry(t *testing.T, app *appServer, kioskID string, expiresAt time.Time) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	orderHex, _ := randomHex(12)
+	orderID := "ord_" + orderHex
+	jobHex, _ := randomHex(12)
+	jobID := "job_" + jobHex
+
+	_, secretHash, err := pins.GenerateOrderOwnershipSecret()
+	if err != nil {
+		t.Fatalf("failed to generate order secret: %v", err)
+	}
+
+	order := store.Order{
+		OrderID:         orderID,
+		OrderSecretHash: secretHash,
+		Status:          contracts.JobStatusPendingPayment,
+		PricePaise:      500,
+		ColorMode:       "BW",
+		Command: contracts.PrintJobCommand{
+			JobID:          jobID,
+			KioskID:        kioskID,
+			DisplayCode:    "PIN-PROTECTED",
+			DownloadURL:    "http://test/download",
+			SHA256Checksum: "dummy_checksum",
+			TotalPages:     2,
+			TotalSheets:    2,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := app.db.CreateOrder(ctx, order); err != nil {
+		t.Fatalf("failed to create order: %v", err)
+	}
+
+	sessHex, _ := randomHex(16)
+	sessionID := "sess_" + sessHex
+	sess := store.PaymentSession{
+		SessionID: sessionID,
+		OrderID:   orderID,
+		KioskID:   kioskID,
+		Status:    store.PaymentSessionActive,
+		CreatedAt: now,
+		ExpiresAt: expiresAt,
+	}
+	if err := app.db.CreatePaymentSession(ctx, sess); err != nil {
+		t.Fatalf("failed to create payment session: %v", err)
+	}
+
+	return orderID, sessionID
+}
+
+func TestPaymentLink_Expiry_Normal20Minutes(t *testing.T) {
+	mockClient := &mockRazorpayClient{}
+	app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+	// Session with generous 30 minutes TTL
+	now := time.Now().UTC()
+	_, sessionID := createOrderAndSessionWithExpiry(t, app, kioskID, now.Add(30*time.Minute))
+
+	bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+	req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Kiosk-ID", kioskID)
+	req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp InitiateQRResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	lastReq := mockClient.getLastLinkReq()
+	expectedMin := now.Add(20*time.Minute - 2*time.Second).Unix()
+	expectedMax := now.Add(20*time.Minute + 2*time.Second).Unix()
+
+	if lastReq.ExpireBy < expectedMin || lastReq.ExpireBy > expectedMax {
+		t.Errorf("expected ExpireBy around %d (+20m), got %d", now.Add(20*time.Minute).Unix(), lastReq.ExpireBy)
+	}
+	if resp.ExpiresAt != lastReq.ExpireBy {
+		t.Errorf("expected response ExpiresAt %d == provider ExpireBy %d", resp.ExpiresAt, lastReq.ExpireBy)
+	}
+}
+
+func TestPaymentLink_Expiry_SessionEarlierThan20Minutes(t *testing.T) {
+	mockClient := &mockRazorpayClient{}
+	app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+	// Session expires in 18 minutes (less than the 20-minute default, but >= 16 minutes)
+	now := time.Now().UTC()
+	sessionExpiresAt := now.Add(18 * time.Minute)
+	_, sessionID := createOrderAndSessionWithExpiry(t, app, kioskID, sessionExpiresAt)
+
+	bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+	req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Kiosk-ID", kioskID)
+	req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp InitiateQRResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	lastReq := mockClient.getLastLinkReq()
+	// Must be capped at sessionExpiresAt and never exceed it
+	if lastReq.ExpireBy > sessionExpiresAt.Unix() {
+		t.Errorf("expected ExpireBy capped at session expiry %d, but got %d", sessionExpiresAt.Unix(), lastReq.ExpireBy)
+	}
+	if resp.ExpiresAt != lastReq.ExpireBy {
+		t.Errorf("expected response ExpiresAt %d == provider ExpireBy %d", resp.ExpiresAt, lastReq.ExpireBy)
+	}
+}
+
+func TestPaymentLink_Expiry_LessThan16MinutesRemaining(t *testing.T) {
+	mockClient := &mockRazorpayClient{}
+	app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+	// Session expires in 15 minutes (under the 16-minute minimum required ahead)
+	now := time.Now().UTC()
+	sessionExpiresAt := now.Add(15 * time.Minute)
+	_, sessionID := createOrderAndSessionWithExpiry(t, app, kioskID, sessionExpiresAt)
+
+	bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+	req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Kiosk-ID", kioskID)
+	req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for insufficient session lifetime, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &errResp)
+	if !strings.Contains(errResp["error"], "insufficient remaining lifetime") {
+		t.Errorf("expected error message mentioning insufficient remaining lifetime, got: %s", errResp["error"])
+	}
+
+	if mockClient.getCallCount() != 0 {
+		t.Errorf("expected provider NOT to be called when session lifetime is insufficient, got %d calls", mockClient.getCallCount())
+	}
+}
+
+func TestPaymentLink_Expiry_ExactBoundaryAndTimestampRounding(t *testing.T) {
+	// Sub-test A: Exactly 16 minutes remaining -> ALLOWED
+	t.Run("exactly_16_minutes_allowed", func(t *testing.T) {
+		mockClient := &mockRazorpayClient{}
+		app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+		now := time.Now().UTC()
+		// Safe whole-second alignment for boundary: 16 minutes + 500ms
+		sessionExpiresAt := now.Add(16*time.Minute + 500*time.Millisecond)
+		_, sessionID := createOrderAndSessionWithExpiry(t, app, kioskID, sessionExpiresAt)
+
+		bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+		req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Kiosk-ID", kioskID)
+		req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK at exactly 16m boundary, got %d: %s", w.Code, w.Body.String())
+		}
+		if mockClient.getCallCount() != 1 {
+			t.Errorf("expected provider called once, got %d", mockClient.getCallCount())
+		}
+	})
+
+	// Sub-test B: Under 16 minutes remaining (15m 58s) -> REJECTED
+	t.Run("under_16_minutes_rejected", func(t *testing.T) {
+		mockClient := &mockRazorpayClient{}
+		app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+		now := time.Now().UTC()
+		sessionExpiresAt := now.Add(16*time.Minute - 2*time.Second)
+		_, sessionID := createOrderAndSessionWithExpiry(t, app, kioskID, sessionExpiresAt)
+
+		bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+		req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Kiosk-ID", kioskID)
+		req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict at under 16m boundary, got %d: %s", w.Code, w.Body.String())
+		}
+		if mockClient.getCallCount() != 0 {
+			t.Errorf("expected provider NOT called, got %d", mockClient.getCallCount())
+		}
+	})
+
+	// Sub-test C: Sub-second precision does not cause rounding underflow
+	t.Run("subsecond_timestamp_precision", func(t *testing.T) {
+		mockClient := &mockRazorpayClient{}
+		app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+		now := time.Now().UTC()
+		sessionExpiresAt := now.Add(18*time.Minute + 750*time.Millisecond)
+		_, sessionID := createOrderAndSessionWithExpiry(t, app, kioskID, sessionExpiresAt)
+
+		bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+		req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Kiosk-ID", kioskID)
+		req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK with subsecond timestamp, got %d: %s", w.Code, w.Body.String())
+		}
+		lastReq := mockClient.getLastLinkReq()
+		if lastReq.ExpireBy != sessionExpiresAt.Unix() {
+			t.Errorf("expected ExpireBy %d == sessionExpiresAt.Unix() %d", lastReq.ExpireBy, sessionExpiresAt.Unix())
+		}
+	})
+}
+
+func TestPaymentLink_ProviderRejectionAndSafeErrorLogging(t *testing.T) {
+	mockClient := &mockRazorpayClient{
+		createLinkFn: func(ctx context.Context, req payments.CreatePaymentLinkRequest) (*payments.PaymentLinkResponse, error) {
+			return nil, &payments.APIError{
+				HTTPStatus:  http.StatusBadRequest,
+				Code:        "BAD_REQUEST_ERROR",
+				Description: "expire_by should be at least 15 minutes greater than current time",
+			}
+		},
+	}
+	app, mux, kioskID, kioskSecret, _ := setupPaymentWorkflowServer(t, mockClient)
+
+	orderID, sessionID := setupOrderAndRedeemPIN(t, app, mux, kioskID, kioskSecret, 500)
+
+	var logBuf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOutput)
+
+	bodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: sessionID})
+	req := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Kiosk-ID", kioskID)
+	req.Header.Set("X-Kiosk-Secret", kioskSecret)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &errResp)
+	if errResp["error"] != "failed to generate payment link from provider" {
+		t.Errorf("expected generic client error, got: %s", errResp["error"])
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, orderID) {
+		t.Errorf("expected log to contain order ID %s, got: %s", orderID, logOutput)
+	}
+	if !strings.Contains(logOutput, "HTTP 400") {
+		t.Errorf("expected log to contain HTTP 400, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "code=BAD_REQUEST_ERROR") {
+		t.Errorf("expected log to contain code=BAD_REQUEST_ERROR, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "expire_by should be at least 15 minutes greater than current time") {
+		t.Errorf("expected log to contain description, got: %s", logOutput)
+	}
+
+	// Verify no secrets, credentials, or sensitive headers leaked
+	if strings.Contains(logOutput, kioskSecret) || strings.Contains(logOutput, "Bearer") || strings.Contains(logOutput, "Basic") {
+		t.Errorf("CRITICAL SECURITY: sensitive credentials detected in log output: %s", logOutput)
+	}
+}
+
+func TestPaymentRecovery_InsufficientSessionLifetime_RefreshPINFlow(t *testing.T) {
+	mockClient := &mockRazorpayClient{}
+	app, mux, kioskID, kioskSecret, webhookSecret := setupPaymentWorkflowServer(t, mockClient)
+	ctx := context.Background()
+
+	// 1. Create unpaid order with known order_secret
+	rawSecret, secretHash, err := pins.GenerateOrderOwnershipSecret()
+	if err != nil {
+		t.Fatalf("failed to generate order ownership secret: %v", err)
+	}
+
+	orderHex, _ := randomHex(12)
+	orderID := "ord_" + orderHex
+	jobHex, _ := randomHex(12)
+	jobID := "job_" + jobHex
+	now := time.Now().UTC()
+
+	order := store.Order{
+		OrderID:         orderID,
+		OrderSecretHash: secretHash,
+		Status:          contracts.JobStatusPendingPayment,
+		PricePaise:      600,
+		ColorMode:       "BW",
+		Command: contracts.PrintJobCommand{
+			JobID:          jobID,
+			KioskID:        kioskID,
+			DisplayCode:    "PIN-PROTECTED",
+			DownloadURL:    "http://test/download",
+			SHA256Checksum: "dummy_checksum",
+			TotalPages:     2,
+			TotalSheets:    2,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := app.db.CreateOrder(ctx, order); err != nil {
+		t.Fatalf("failed to create order: %v", err)
+	}
+
+	// 2. Issue initial PIN (e.g. "1234")
+	pin1 := "1234"
+	pin1HMAC, err := pins.ComputePINHMAC(app.cfg.pickupPINHMACSecret, kioskID, pin1)
+	if err != nil {
+		t.Fatalf("failed to compute PIN HMAC: %v", err)
+	}
+	pin1IDHex, _ := randomHex(12)
+	err = app.db.CreatePickupPIN(ctx, store.PickupPIN{
+		ID:        "pin_" + pin1IDHex,
+		OrderID:   orderID,
+		KioskID:   kioskID,
+		PINHMAC:   pin1HMAC,
+		CreatedAt: now,
+		ExpiresAt: now.Add(15 * time.Minute),
+	}, 50)
+	if err != nil {
+		t.Fatalf("failed to create initial pickup PIN: %v", err)
+	}
+
+	// 3. Customer redeems pin1 at the kiosk -> creates session 1
+	redeemReqBytes, _ := json.Marshal(pins.PINRedemptionRequest{PIN: pin1})
+	req := httptest.NewRequest(http.MethodPost, "/api/kiosk/pin/redeem", bytes.NewReader(redeemReqBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Kiosk-ID", kioskID)
+	req.Header.Set("X-Kiosk-Secret", kioskSecret)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK redeeming pin1, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var redeemResp pins.PINRedemptionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &redeemResp); err != nil {
+		t.Fatalf("failed to parse redeem response: %v", err)
+	}
+	session1ID := redeemResp.SessionID
+	if session1ID == "" {
+		t.Fatalf("expected non-empty session ID")
+	}
+
+	// 4. Invariant: Re-entering pin1 MUST be rejected (single-use PIN protection)
+	reqReenter := httptest.NewRequest(http.MethodPost, "/api/kiosk/pin/redeem", bytes.NewReader(redeemReqBytes))
+	reqReenter.Header.Set("Content-Type", "application/json")
+	reqReenter.Header.Set("X-Kiosk-ID", kioskID)
+	reqReenter.Header.Set("X-Kiosk-Secret", kioskSecret)
+	wReenter := httptest.NewRecorder()
+	mux.ServeHTTP(wReenter, reqReenter)
+	if wReenter.Code != http.StatusBadRequest {
+		t.Fatalf("security violation: re-entering consumed pin1 should return 400 Bad Request, got %d", wReenter.Code)
+	}
+
+	// 5. Simulate session 1 aging until < 16 minutes remain (e.g. 15 minutes left)
+	if err := app.db.UpdatePaymentSessionExpiry(ctx, session1ID, now.Add(15*time.Minute)); err != nil {
+		t.Fatalf("failed to update session expiry: %v", err)
+	}
+
+	// 6. Kiosk calls initiate-qr on session1 -> MUST return HTTP 409 Conflict with accurate actionable error
+	initBodyBytes, _ := json.Marshal(InitiateQRRequest{SessionID: session1ID})
+	reqInit := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(initBodyBytes))
+	reqInit.Header.Set("Content-Type", "application/json")
+	reqInit.Header.Set("X-Kiosk-ID", kioskID)
+	reqInit.Header.Set("X-Kiosk-Secret", kioskSecret)
+	wInit := httptest.NewRecorder()
+	mux.ServeHTTP(wInit, reqInit)
+
+	if wInit.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for insufficient session lifetime, got %d: %s", wInit.Code, wInit.Body.String())
+	}
+
+	var errResp map[string]string
+	_ = json.Unmarshal(wInit.Body.Bytes(), &errResp)
+	expectedErrMsg := "payment session has insufficient remaining lifetime; tap 'Refresh PIN' on your order screen and enter the new PIN"
+	if errResp["error"] != expectedErrMsg {
+		t.Fatalf("unexpected error message.\nexpected: %q\ngot:      %q", expectedErrMsg, errResp["error"])
+	}
+
+	// Provider must NOT have been called
+	if mockClient.getCallCount() != 0 {
+		t.Fatalf("expected provider not to be called, got %d calls", mockClient.getCallCount())
+	}
+
+	// 7. Customer follows instruction: taps 'Refresh PIN' on their mobile order screen
+	// Sends POST /api/orders/{order_id}/pin/refresh with proof of ownership (order_secret)
+	refreshBody, _ := json.Marshal(pins.PINRefreshRequest{OrderSecret: rawSecret})
+	reqRefresh := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/pin/refresh", orderID), bytes.NewReader(refreshBody))
+	reqRefresh.Header.Set("Content-Type", "application/json")
+	wRefresh := httptest.NewRecorder()
+	mux.ServeHTTP(wRefresh, reqRefresh)
+
+	if wRefresh.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on PIN refresh, got %d: %s", wRefresh.Code, wRefresh.Body.String())
+	}
+
+	var refreshResp pins.PINRefreshResponse
+	if err := json.Unmarshal(wRefresh.Body.Bytes(), &refreshResp); err != nil {
+		t.Fatalf("failed to decode refresh response: %v", err)
+	}
+	pin2 := refreshResp.PickupPIN
+	if len(pin2) != 4 {
+		t.Fatalf("expected 4-digit refreshed PIN, got %q", pin2)
+	}
+
+	// 8. Session 1 is now invalidated/expired
+	sess1AfterRefresh, err := app.db.GetPaymentSession(ctx, session1ID)
+	if err != nil || sess1AfterRefresh == nil {
+		t.Fatalf("failed to query session 1: %v", err)
+	}
+	if sess1AfterRefresh.Status != store.PaymentSessionExpired {
+		t.Fatalf("expected session 1 status to be EXPIRED, got %s", sess1AfterRefresh.Status)
+	}
+
+	// Attempting initiate-qr on session1 now returns 404 Not Found (expired)
+	reqInitDead := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(initBodyBytes))
+	reqInitDead.Header.Set("Content-Type", "application/json")
+	reqInitDead.Header.Set("X-Kiosk-ID", kioskID)
+	reqInitDead.Header.Set("X-Kiosk-Secret", kioskSecret)
+	wInitDead := httptest.NewRecorder()
+	mux.ServeHTTP(wInitDead, reqInitDead)
+	if wInitDead.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for expired session 1, got %d: %s", wInitDead.Code, wInitDead.Body.String())
+	}
+
+	// 9. Customer enters pin2 on kiosk touchscreen
+	redeem2Bytes, _ := json.Marshal(pins.PINRedemptionRequest{PIN: pin2})
+	reqRedeem2 := httptest.NewRequest(http.MethodPost, "/api/kiosk/pin/redeem", bytes.NewReader(redeem2Bytes))
+	reqRedeem2.Header.Set("Content-Type", "application/json")
+	reqRedeem2.Header.Set("X-Kiosk-ID", kioskID)
+	reqRedeem2.Header.Set("X-Kiosk-Secret", kioskSecret)
+	wRedeem2 := httptest.NewRecorder()
+	mux.ServeHTTP(wRedeem2, reqRedeem2)
+
+	if wRedeem2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK redeeming pin2, got %d: %s", wRedeem2.Code, wRedeem2.Body.String())
+	}
+
+	var redeem2Resp pins.PINRedemptionResponse
+	if err := json.Unmarshal(wRedeem2.Body.Bytes(), &redeem2Resp); err != nil {
+		t.Fatalf("failed to decode redemption 2 response: %v", err)
+	}
+	session2ID := redeem2Resp.SessionID
+	if session2ID == "" || session2ID == session1ID {
+		t.Fatalf("expected fresh new session ID, got %s (session1 was %s)", session2ID, session1ID)
+	}
+
+	// Invariant: pin2 is also strictly single-use
+	reqReenter2 := httptest.NewRequest(http.MethodPost, "/api/kiosk/pin/redeem", bytes.NewReader(redeem2Bytes))
+	reqReenter2.Header.Set("Content-Type", "application/json")
+	reqReenter2.Header.Set("X-Kiosk-ID", kioskID)
+	reqReenter2.Header.Set("X-Kiosk-Secret", kioskSecret)
+	wReenter2 := httptest.NewRecorder()
+	mux.ServeHTTP(wReenter2, reqReenter2)
+	if wReenter2.Code != http.StatusBadRequest {
+		t.Fatalf("security violation: re-entering consumed pin2 should return 400 Bad Request, got %d", wReenter2.Code)
+	}
+
+	// 10. Kiosk calls initiate-qr on session2 -> SUCCEEDS!
+	init2Bytes, _ := json.Marshal(InitiateQRRequest{SessionID: session2ID})
+	reqInit2 := httptest.NewRequest(http.MethodPost, "/api/kiosk/payment/initiate-qr", bytes.NewReader(init2Bytes))
+	reqInit2.Header.Set("Content-Type", "application/json")
+	reqInit2.Header.Set("X-Kiosk-ID", kioskID)
+	reqInit2.Header.Set("X-Kiosk-Secret", kioskSecret)
+	wInit2 := httptest.NewRecorder()
+	mux.ServeHTTP(wInit2, reqInit2)
+
+	if wInit2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on initiate-qr with session 2, got %d: %s", wInit2.Code, wInit2.Body.String())
+	}
+
+	var qrResp InitiateQRResponse
+	if err := json.Unmarshal(wInit2.Body.Bytes(), &qrResp); err != nil {
+		t.Fatalf("failed to parse initiate-qr response: %v", err)
+	}
+	if qrResp.SessionID != session2ID {
+		t.Fatalf("expected session ID %s, got %s", session2ID, qrResp.SessionID)
+	}
+	if qrResp.AmountPaise != 600 {
+		t.Fatalf("expected amount 600 paise, got %d", qrResp.AmountPaise)
+	}
+
+	// Verify provider was called with normal 20m expiry
+	if mockClient.getCallCount() != 1 {
+		t.Fatalf("expected exactly 1 provider call, got %d", mockClient.getCallCount())
+	}
+
+	// 11. Customer pays via Razorpay -> Webhook confirms payment
+	attemptID := qrResp.AttemptID
+	eventID := "evt_recovery_test_1"
+	webhookPayload := map[string]interface{}{
+		"entity": "event",
+		"event":  "payment_link.paid",
+		"payload": map[string]interface{}{
+			"payment_link": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":          qrResp.RazorpayQRID,
+					"amount":      600,
+					"amount_paid": 600,
+					"currency":    "INR",
+					"status":      "paid",
+					"notes": map[string]interface{}{
+						"order_id":   orderID,
+						"kiosk_id":   kioskID,
+						"session_id": session2ID,
+						"attempt_id": attemptID,
+					},
+				},
+			},
+			"payment": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":       "pay_recovery_test_1",
+					"amount":   600,
+					"currency": "INR",
+					"status":   "captured",
+					"notes": map[string]interface{}{
+						"order_id":   orderID,
+						"kiosk_id":   kioskID,
+						"session_id": session2ID,
+					},
+				},
+			},
+		},
+	}
+	payloadBytes, _ := json.Marshal(webhookPayload)
+	sig := computeWebhookSignature(payloadBytes, webhookSecret)
+
+	reqHook := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", bytes.NewReader(payloadBytes))
+	reqHook.Header.Set("Content-Type", "application/json")
+	reqHook.Header.Set("X-Razorpay-Signature", sig)
+	reqHook.Header.Set("X-Razorpay-Event-Id", eventID)
+	wHook := httptest.NewRecorder()
+	mux.ServeHTTP(wHook, reqHook)
+
+	if wHook.Code != http.StatusOK {
+		t.Fatalf("expected webhook 200 OK, got %d: %s", wHook.Code, wHook.Body.String())
+	}
+
+	// 12. Verify order transitioned to PAID_WAITING
+	paidOrder, err := app.db.GetOrder(ctx, orderID)
+	if err != nil || paidOrder == nil {
+		t.Fatalf("failed to query paid order: %v", err)
+	}
+	if paidOrder.Status != contracts.JobStatusPaidWaiting {
+		t.Fatalf("expected order status PAID_WAITING, got %s", paidOrder.Status)
+	}
+
+	// 13. Invariant: Customer CANNOT refresh PIN after payment is completed
+	reqRefreshAfterPay := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/pin/refresh", orderID), bytes.NewReader(refreshBody))
+	reqRefreshAfterPay.Header.Set("Content-Type", "application/json")
+	wRefreshAfterPay := httptest.NewRecorder()
+	mux.ServeHTTP(wRefreshAfterPay, reqRefreshAfterPay)
+	if wRefreshAfterPay.Code != http.StatusBadRequest {
+		t.Fatalf("security violation: PIN refresh on paid order must return 400 Bad Request, got %d", wRefreshAfterPay.Code)
+	}
+
+	// 14. Invariant: Duplicate webhook delivery is idempotent and does NOT re-process
+	reqHookDup := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", bytes.NewReader(payloadBytes))
+	reqHookDup.Header.Set("Content-Type", "application/json")
+	reqHookDup.Header.Set("X-Razorpay-Signature", sig)
+	reqHookDup.Header.Set("X-Razorpay-Event-Id", eventID)
+	wHookDup := httptest.NewRecorder()
+	mux.ServeHTTP(wHookDup, reqHookDup)
+	if wHookDup.Code != http.StatusOK {
+		t.Fatalf("expected duplicate webhook 200 OK, got %d", wHookDup.Code)
+	}
+	if !strings.Contains(wHookDup.Body.String(), "duplicate") {
+		t.Fatalf("expected duplicate status in response, got %s", wHookDup.Body.String())
 	}
 }
 

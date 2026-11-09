@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -173,15 +175,26 @@ func (s *appServer) handleKioskInitiateQR(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 8. Compute QR close_by timestamp (cannot exceed session TTL; minimum 3 minutes into future)
-	closeBy := session.ExpiresAt.Unix()
-	maxQRTTL := now.Add(15 * time.Minute).Unix()
-	if closeBy > maxQRTTL {
-		closeBy = maxQRTTL
+	// 8. Compute payment link expiry timestamp (default 20 minutes, capped at session.ExpiresAt).
+	// Razorpay requires expire_by to be at least 15 minutes in the future when received.
+	// We require at least 16 minutes of remaining lifetime to guarantee validity over the wire.
+	const normalExpiryDuration = 20 * time.Minute
+	const minRemainingLifetime = 16 * time.Minute
+
+	targetExpiry := now.Add(normalExpiryDuration)
+	if targetExpiry.After(session.ExpiresAt) {
+		targetExpiry = session.ExpiresAt
 	}
-	minCloseBy := now.Add(3 * time.Minute).Unix()
-	if closeBy < minCloseBy {
-		closeBy = minCloseBy
+
+	closeBy := targetExpiry.Unix()
+	minExpireBy := now.Unix() + int64(minRemainingLifetime/time.Second)
+	if closeBy < minExpireBy {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "payment session has insufficient remaining lifetime; tap 'Refresh PIN' on your order screen and enter the new PIN",
+		})
+		return
 	}
 
 	// 9. Determine payment method and call Razorpay provider
@@ -226,6 +239,15 @@ func (s *appServer) handleKioskInitiateQR(w http.ResponseWriter, r *http.Request
 			},
 		})
 		if err != nil {
+			status, code, desc := sanitizeErrorForLog(err)
+			if status > 0 || code != "" {
+				log.Printf("[ERROR] Razorpay UPI QR creation failed for order %s: HTTP %d, code=%s, desc=%s",
+					order.OrderID, status, code, desc)
+			} else {
+				log.Printf("[ERROR] Razorpay UPI QR creation failed for order %s: %s",
+					order.OrderID, desc)
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -263,6 +285,15 @@ func (s *appServer) handleKioskInitiateQR(w http.ResponseWriter, r *http.Request
 			},
 		})
 		if err != nil {
+			status, code, desc := sanitizeErrorForLog(err)
+			if status > 0 || code != "" {
+				log.Printf("[ERROR] Razorpay payment link creation failed for order %s: HTTP %d, code=%s, desc=%s",
+					order.OrderID, status, code, desc)
+			} else {
+				log.Printf("[ERROR] Razorpay payment link creation failed for order %s: %s",
+					order.OrderID, desc)
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -490,4 +521,38 @@ func (s *appServer) handleKioskPaymentStatus(w http.ResponseWriter, r *http.Requ
 		SessionStatus: string(session.Status),
 		IsPaid:        isPaid,
 	})
+}
+
+// sanitizeErrorForLog extracts structured upstream error fields and sanitizes descriptions.
+func sanitizeErrorForLog(err error) (status int, code string, desc string) {
+	if err == nil {
+		return 0, "", ""
+	}
+	var apiErr *payments.APIError
+	if errors.As(err, &apiErr) {
+		status = apiErr.HTTPStatus
+		code = apiErr.Code
+		desc = sanitizeLogString(apiErr.Description)
+		return
+	}
+	desc = sanitizeLogString(err.Error())
+	return
+}
+
+// sanitizeLogString removes control characters and newlines to prevent log injection,
+// and bounds string length without logging sensitive credentials or tokens.
+func sanitizeLogString(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 32 && r <= 126 {
+			b.WriteRune(r)
+		} else if r == ' ' {
+			b.WriteRune(' ')
+		}
+	}
+	clean := strings.TrimSpace(b.String())
+	if len(clean) > 256 {
+		clean = clean[:256] + "..."
+	}
+	return clean
 }

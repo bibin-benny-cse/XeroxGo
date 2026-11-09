@@ -134,6 +134,23 @@ type PaymentEntity struct {
 	CreatedAt   int64             `json:"created_at"`
 }
 
+// APIError represents an upstream error returned by the Razorpay API.
+type APIError struct {
+	HTTPStatus  int
+	Code        string
+	Description string
+}
+
+func (e *APIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("razorpay api error (status %d, code %s): %s", e.HTTPStatus, e.Code, e.Description)
+	}
+	return fmt.Sprintf("razorpay api error: HTTP %d", e.HTTPStatus)
+}
+
 // razorpayErrorEnvelope represents Razorpay's structured error JSON.
 type razorpayErrorEnvelope struct {
 	Error struct {
@@ -232,9 +249,15 @@ func (c *Client) CreateUPIQRCode(ctx context.Context, req CreateQRCodeRequest) (
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errEnv razorpayErrorEnvelope
 		if jsonErr := json.Unmarshal(respBytes, &errEnv); jsonErr == nil && errEnv.Error.Code != "" {
-			return nil, fmt.Errorf("razorpay api error (status %d, code %s): %s", resp.StatusCode, errEnv.Error.Code, errEnv.Error.Description)
+			return nil, &APIError{
+				HTTPStatus:  resp.StatusCode,
+				Code:        errEnv.Error.Code,
+				Description: errEnv.Error.Description,
+			}
 		}
-		return nil, fmt.Errorf("razorpay api error: HTTP %d", resp.StatusCode)
+		return nil, &APIError{
+			HTTPStatus: resp.StatusCode,
+		}
 	}
 
 	var qrResp QRCodeResponse
@@ -299,9 +322,15 @@ func (c *Client) CreatePaymentLink(ctx context.Context, req CreatePaymentLinkReq
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errEnv razorpayErrorEnvelope
 		if jsonErr := json.Unmarshal(respBytes, &errEnv); jsonErr == nil && errEnv.Error.Code != "" {
-			return nil, fmt.Errorf("razorpay api error (status %d, code %s): %s", resp.StatusCode, errEnv.Error.Code, errEnv.Error.Description)
+			return nil, &APIError{
+				HTTPStatus:  resp.StatusCode,
+				Code:        errEnv.Error.Code,
+				Description: errEnv.Error.Description,
+			}
 		}
-		return nil, fmt.Errorf("razorpay api error: HTTP %d", resp.StatusCode)
+		return nil, &APIError{
+			HTTPStatus: resp.StatusCode,
+		}
 	}
 
 	var linkResp PaymentLinkResponse
@@ -347,9 +376,15 @@ func (c *Client) FetchPayment(ctx context.Context, paymentID string) (*PaymentEn
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errEnv razorpayErrorEnvelope
 		if jsonErr := json.Unmarshal(respBytes, &errEnv); jsonErr == nil && errEnv.Error.Code != "" {
-			return nil, fmt.Errorf("razorpay api error (status %d, code %s): %s", resp.StatusCode, errEnv.Error.Code, errEnv.Error.Description)
+			return nil, &APIError{
+				HTTPStatus:  resp.StatusCode,
+				Code:        errEnv.Error.Code,
+				Description: errEnv.Error.Description,
+			}
 		}
-		return nil, fmt.Errorf("razorpay api error: HTTP %d", resp.StatusCode)
+		return nil, &APIError{
+			HTTPStatus: resp.StatusCode,
+		}
 	}
 
 	var payment PaymentEntity
