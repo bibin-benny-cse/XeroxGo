@@ -338,22 +338,7 @@ func (c *Client) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		c.currentModeMu.Lock()
-		mode := c.currentMode
-		c.currentModeMu.Unlock()
-		if mode != "" && mode != ui_ipc.ModeIdle {
-			return
-		}
-		_ = c.renderScreen(ui_ipc.ScreenState{
-			Mode:      ui_ipc.ModeIdle,
-			QRContent: c.cfg.IdleQRContent,
-			Message:   "Ready to print",
-		})
+		c.renderInitialIdleIfUnset(ctx)
 	}()
 
 	// 2. Startup recovery check: handle interrupted PRINTING state safely
@@ -1036,10 +1021,39 @@ func (c *Client) downloadAndVerify(ctx context.Context, cmd contracts.PrintJobCo
 	return nil
 }
 
-func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
+// renderInitialIdleIfUnset renders the initial idle screen only if no screen transition
+// has occurred yet and ctx has not been canceled. The mode check and render execute
+// atomically under renderMu so a late startup render can never overwrite a newer screen.
+func (c *Client) renderInitialIdleIfUnset(ctx context.Context) {
 	c.renderMu.Lock()
 	defer c.renderMu.Unlock()
 
+	if ctx.Err() != nil {
+		return
+	}
+
+	c.currentModeMu.Lock()
+	alreadyRendered := c.currentMode != ""
+	c.currentModeMu.Unlock()
+	if alreadyRendered {
+		return
+	}
+
+	_ = c.renderScreenLocked(ui_ipc.ScreenState{
+		Mode:      ui_ipc.ModeIdle,
+		QRContent: c.cfg.IdleQRContent,
+		Message:   "Ready to print",
+	})
+}
+
+func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
+	c.renderMu.Lock()
+	defer c.renderMu.Unlock()
+	return c.renderScreenLocked(state)
+}
+
+// renderScreenLocked executes the screen transition while c.renderMu is held by the caller.
+func (c *Client) renderScreenLocked(state ui_ipc.ScreenState) error {
 	if state.PrinterModel == "" && c.cfg.PrinterModel != "" {
 		state.PrinterModel = c.cfg.PrinterModel
 	}
@@ -1208,10 +1222,14 @@ func (c *Client) fetchInitialAds() {
 	u.RawQuery = ""
 
 	resp, err := c.cfg.HTTPClient.Get(u.String())
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
 
 	var ads []contracts.AdItem
 	if err := json.NewDecoder(resp.Body).Decode(&ads); err == nil && len(ads) > 0 {

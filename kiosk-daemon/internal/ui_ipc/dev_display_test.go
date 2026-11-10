@@ -162,3 +162,50 @@ func TestDevelopmentMode_BadgeRendered(t *testing.T) {
 		t.Fatalf("RenderTo failed: %v", err)
 	}
 }
+
+func TestDevDisplayAdapter_DisablePNG(t *testing.T) {
+	tmpDir := t.TempDir()
+	pngPath := filepath.Join(tmpDir, "disabled_screen.png")
+
+	adapter, err := NewDevDisplayAdapter(DevDisplayConfig{
+		PreviewFile:     pngPath,
+		DisableTerminal: true,
+		DisablePNG:      true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create DevDisplayAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Seed stale PNG data to ensure Sink clears it instead of publishing stale bytes.
+	adapter.mu.Lock()
+	adapter.latestPNG = []byte("stale-png-bytes")
+	adapter.mu.Unlock()
+
+	if err := adapter.Sink(nil); err == nil {
+		t.Fatalf("expected error for nil image even when DisablePNG is enabled")
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	if err := adapter.Sink(img); err != nil {
+		t.Fatalf("Sink with DisablePNG failed: %v", err)
+	}
+
+	if pngBytes := adapter.GetLatestPNG(); len(pngBytes) != 0 {
+		t.Fatalf("expected empty latestPNG when DisablePNG is true, got %d bytes", len(pngBytes))
+	}
+
+	if _, err := os.Stat(pngPath); !os.IsNotExist(err) {
+		t.Fatalf("expected preview file not to be created when DisablePNG is true, got stat err=%v", err)
+	}
+
+	adapter.ObserveState(ScreenState{
+		Mode:         ModePaymentQR,
+		OrderID:      "ord_disable_png",
+		AmountPaise:  300,
+		PaymentQRURL: "https://rzp.io/i/disablepng",
+	})
+	if got := adapter.GetLastState(); got.Mode != ModePaymentQR || got.PaymentQRURL != "https://rzp.io/i/disablepng" {
+		t.Fatalf("unexpected state when DisablePNG is true: %+v", got)
+	}
+}

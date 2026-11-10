@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -843,5 +844,76 @@ func TestWorkflow_InterruptedPrintingRestart_MarksPausedError_DoesNotReprint(t *
 	client.handleIncomingJob(cmd)
 	if len(client.jobQueue) != 0 {
 		t.Fatalf("expected incoming notification for interrupted job to be rejected, got %d in jobQueue", len(client.jobQueue))
+	}
+}
+
+func TestSpooler_RenderInitialIdleDoesNotOverwriteNewerScreen(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("failed to open test state store: %v", err)
+	}
+	defer store.Close()
+
+	var obsMu sync.Mutex
+	var observedModes []ui_ipc.ScreenMode
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:       "ws://127.0.0.1:8080/ws",
+		KioskID:        "kiosk-toctou-01",
+		KioskSecret:    "sec_kiosk_toctou_test",
+		BackendBaseURL: "http://mock-backend",
+		StateStore:     store,
+		PrinterAddr:    "127.0.0.1:9100",
+		DownloadDir:    tempDir,
+		IdleQRContent:  "https://xeroxgo.app/kiosk-toctou-01",
+		ScreenSink:     func(img *image.RGBA) error { return nil },
+		StateObserver: func(st ui_ipc.ScreenState) {
+			obsMu.Lock()
+			observedModes = append(observedModes, st.Mode)
+			obsMu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Simulate an in-flight newer screen transition holding renderMu before
+	// the initial idle goroutine reaches its lock/mode check.
+	client.renderMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.renderInitialIdleIfUnset(context.Background())
+	}()
+
+	// Give the goroutine a moment to block on renderMu
+	time.Sleep(20 * time.Millisecond)
+
+	err = client.renderScreenLocked(ui_ipc.ScreenState{
+		Mode:         ui_ipc.ModePaymentQR,
+		OrderID:      "ord_toctou",
+		AmountPaise:  300,
+		PaymentQRURL: "https://rzp.io/i/toctou",
+	})
+	client.renderMu.Unlock()
+	if err != nil {
+		t.Fatalf("renderScreenLocked failed: %v", err)
+	}
+
+	<-done
+
+	client.currentModeMu.Lock()
+	gotMode := client.currentMode
+	client.currentModeMu.Unlock()
+	if gotMode != ui_ipc.ModePaymentQR {
+		t.Fatalf("expected currentMode to remain %s, got %s", ui_ipc.ModePaymentQR, gotMode)
+	}
+
+	obsMu.Lock()
+	modes := append([]ui_ipc.ScreenMode(nil), observedModes...)
+	obsMu.Unlock()
+	if len(modes) != 1 || modes[0] != ui_ipc.ModePaymentQR {
+		t.Fatalf("expected observed modes [%s], got %v", ui_ipc.ModePaymentQR, modes)
 	}
 }

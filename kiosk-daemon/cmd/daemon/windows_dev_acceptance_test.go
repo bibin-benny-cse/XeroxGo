@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -28,6 +29,121 @@ import (
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 	"xeroxgo/pkg/contracts"
 )
+
+// syncBuffer is a goroutine-safe io.Writer backed by bytes.Buffer.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// acceptanceTrace records sanitized endpoint status and screen mode transitions
+// safely across background handlers without calling t.Log from worker goroutines.
+type acceptanceTrace struct {
+	mu               sync.Mutex
+	wsRequests       int
+	wsStatus         int
+	wsErr            string
+	pinRedeemCount   int
+	pinRedeemStatus  int
+	pinRedeemErr     string
+	qrInitCount      int
+	qrInitStatus     int
+	qrInitErr        string
+	qrFetchCount     int
+	qrFetchStatus    int
+	payPollCount     int
+	payPollPaidCount int
+	payPollStatus    int
+	modes            []ui_ipc.ScreenMode
+}
+
+func (tr *acceptanceTrace) recordWS(status int, errMsg string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.wsRequests++
+	tr.wsStatus = status
+	tr.wsErr = errMsg
+}
+
+func (tr *acceptanceTrace) recordPINRedeem(status int, errMsg string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.pinRedeemCount++
+	tr.pinRedeemStatus = status
+	tr.pinRedeemErr = errMsg
+}
+
+func (tr *acceptanceTrace) recordQRInit(status int, errMsg string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.qrInitCount++
+	tr.qrInitStatus = status
+	tr.qrInitErr = errMsg
+}
+
+func (tr *acceptanceTrace) recordQRFetch(status int) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.qrFetchCount++
+	tr.qrFetchStatus = status
+}
+
+func (tr *acceptanceTrace) recordPayPoll(status int, paid bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.payPollCount++
+	tr.payPollStatus = status
+	if paid && status == http.StatusOK {
+		tr.payPollPaidCount++
+	}
+}
+
+func (tr *acceptanceTrace) recordMode(mode ui_ipc.ScreenMode) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.modes = append(tr.modes, mode)
+}
+
+func (tr *acceptanceTrace) hasMode(target ui_ipc.ScreenMode) bool {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	for _, m := range tr.modes {
+		if m == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (tr *acceptanceTrace) summary() string {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	modeNames := make([]string, len(tr.modes))
+	for i, m := range tr.modes {
+		modeNames[i] = string(m)
+	}
+	return fmt.Sprintf(
+		"ws(req=%d,status=%d,err=%q) pin_redeem(calls=%d,status=%d,err=%q) qr_init(calls=%d,status=%d,err=%q) qr_fetch(calls=%d,status=%d) pay_poll(calls=%d,paid=%d,status=%d) modes=%v",
+		tr.wsRequests, tr.wsStatus, tr.wsErr,
+		tr.pinRedeemCount, tr.pinRedeemStatus, tr.pinRedeemErr,
+		tr.qrInitCount, tr.qrInitStatus, tr.qrInitErr,
+		tr.qrFetchCount, tr.qrFetchStatus,
+		tr.payPollCount, tr.payPollPaidCount, tr.payPollStatus,
+		modeNames,
+	)
+}
 
 // TestWindowsDevMode_FullAcceptanceWorkflow tests the complete end-to-end Windows development workflow:
 // Customer Uploads PDF -> PIN appears -> Daemon accepts PIN from Keyboard -> Payment Link created
@@ -52,11 +168,12 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	pdfHash := sha256.Sum256(pdfBytes)
 	pdfChecksum := hex.EncodeToString(pdfHash[:])
 
-	// 2. Mock Backend State
+	// 2. Mock Backend State & Sanitized Observability
 	var isPaid atomic.Bool
 	var printJobDispatched atomic.Bool
 	var activeWSConn atomic.Pointer[websocket.Conn]
 	var acceptedWSCount atomic.Int32
+	trace := &acceptanceTrace{}
 
 	// Create test QR PNG
 	qrImg := image.NewRGBA(image.Rect(0, 0, 100, 100))
@@ -73,15 +190,18 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	// Kiosk PIN redemption endpoint
 	mux.HandleFunc("/api/kiosk/pin/redeem", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Kiosk-ID") != testKioskID || r.Header.Get("X-Kiosk-Secret") != testKioskSecret {
+			trace.recordPINRedeem(http.StatusUnauthorized, "unauthorized")
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body["pin"] != testPIN {
+			trace.recordPINRedeem(http.StatusBadRequest, "invalid_pin")
 			http.Error(w, `{"error":"invalid_pin"}`, http.StatusBadRequest)
 			return
 		}
+		trace.recordPINRedeem(http.StatusOK, "")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":             "ready_for_payment",
@@ -100,9 +220,11 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	// Kiosk Initiate Payment QR endpoint
 	mux.HandleFunc("/api/kiosk/payment/initiate-qr", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Kiosk-ID") != testKioskID || r.Header.Get("X-Kiosk-Secret") != testKioskSecret {
+			trace.recordQRInit(http.StatusUnauthorized, "unauthorized")
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
+		trace.recordQRInit(http.StatusOK, "")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"attempt_id":     "att_dev_001",
@@ -120,6 +242,7 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 
 	// QR Image download endpoint
 	mux.HandleFunc("/api/kiosk/payment/qr.png", func(w http.ResponseWriter, r *http.Request) {
+		trace.recordQRFetch(http.StatusOK)
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(qrPNGBuffer.Bytes())
 	})
@@ -132,13 +255,17 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 			orderSt = "PAID_WAITING"
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"session_id":     testSessionID,
 			"order_id":       testOrderID,
 			"order_status":   orderSt,
 			"session_status": "active",
 			"is_paid":        paid,
-		})
+		}); err != nil {
+			trace.recordPayPoll(http.StatusInternalServerError, false)
+			return
+		}
+		trace.recordPayPoll(http.StatusOK, paid)
 	})
 
 	// PDF Download endpoint
@@ -150,25 +277,23 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	// WebSocket Hub endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		kioskID := r.URL.Query().Get("kiosk_id")
-		t.Logf("[DIAG-TEST] Mock server /ws handler received request: Method=%s, RemoteAddr=%s, kiosk_id=%s",
-			r.Method, r.RemoteAddr, kioskID)
 		if kioskID != testKioskID {
-			t.Logf("[DIAG-TEST] Mock server /ws rejected request: expected kiosk_id=%s, got %s", testKioskID, kioskID)
+			trace.recordWS(http.StatusBadRequest, "missing or invalid kiosk_id")
 			http.Error(w, "missing or invalid kiosk_id", http.StatusBadRequest)
 			return
 		}
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
-			t.Logf("[MOCK HUB] Accept failed from %s: %v", r.RemoteAddr, err)
+			trace.recordWS(http.StatusInternalServerError, err.Error())
 			return
 		}
+		trace.recordWS(http.StatusSwitchingProtocols, "")
 		acceptedWSCount.Add(1)
 		activeWSConn.Store(conn)
 		defer func() {
 			activeWSConn.Store(nil)
 			_ = conn.Close(websocket.StatusNormalClosure, "done")
 		}()
-		t.Logf("[MOCK HUB] Accepted WebSocket connection #%d from %s (kiosk_id=%s)", acceptedWSCount.Load(), r.RemoteAddr, kioskID)
 
 		for {
 			var msg map[string]interface{}
@@ -179,7 +304,10 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	})
 
 	server := httptest.NewServer(mux)
-	defer server.Close()
+	defer func() {
+		cancel()
+		server.Close()
+	}()
 
 	u, _ := url.Parse(server.URL)
 	wsURL := "ws://" + u.Host + "/ws"
@@ -195,12 +323,13 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	}
 	defer stateStore.Close()
 
-	// 4. Initialize Dev Display Adapter (captures terminal output & PNG)
-	var terminalBuf bytes.Buffer
+	// 4. Initialize Dev Display Adapter (captures terminal output cleanly; PNG encoding skipped in headless test)
+	terminalBuf := &syncBuffer{}
 	devDisplay, err := ui_ipc.NewDevDisplayAdapter(ui_ipc.DevDisplayConfig{
-		PreviewFile:   "", // Disabled in test to prevent disk I/O bottlenecks under race detection
-		WebPort:       0,  // disabled in test
-		ConsoleWriter: &terminalBuf,
+		PreviewFile:   "",
+		WebPort:       0,
+		DisablePNG:    true,
+		ConsoleWriter: terminalBuf,
 	})
 	if err != nil {
 		t.Fatalf("failed to create DevDisplayAdapter: %v", err)
@@ -213,26 +342,32 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start dev printer: %v", err)
 	}
-	defer cleanupPrinter()
+	defer func() {
+		cleanupPrinter()
+		devPrinterWg.Wait()
+	}()
 
 	// 6. Build Spooler Client with Dev Adapters
 	clientCfg := spooler.ClientConfig{
-		CloudURL:                 wsURL,
-		KioskID:                  testKioskID,
-		KioskSecret:              testKioskSecret,
-		BackendBaseURL:           server.URL,
-		HTTPClient:               server.Client(),
-		MinBackoff:               20 * time.Millisecond,
-		MaxBackoff:               100 * time.Millisecond,
-		HeartbeatInterval:        100 * time.Millisecond,
-		PaymentPollInterval:      100 * time.Millisecond,
-		StateStore:               stateStore,
-		PrinterAddr:              printerAddr,
-		PrinterModel:             "Brother HL-L5210DN (Simulated Dev Mode)",
-		DownloadDir:              downloadDir,
-		IdleQRContent:            server.URL + "/k/" + testKioskID,
-		ScreenSink:               devDisplay.Sink,
-		StateObserver:            devDisplay.ObserveState,
+		CloudURL:            wsURL,
+		KioskID:             testKioskID,
+		KioskSecret:         testKioskSecret,
+		BackendBaseURL:      server.URL,
+		HTTPClient:          server.Client(),
+		MinBackoff:          20 * time.Millisecond,
+		MaxBackoff:          100 * time.Millisecond,
+		HeartbeatInterval:   100 * time.Millisecond,
+		PaymentPollInterval: 100 * time.Millisecond,
+		StateStore:          stateStore,
+		PrinterAddr:         printerAddr,
+		PrinterModel:        "Brother HL-L5210DN (Simulated Dev Mode)",
+		DownloadDir:         downloadDir,
+		IdleQRContent:       server.URL + "/k/" + testKioskID,
+		ScreenSink:          devDisplay.Sink,
+		StateObserver: func(st ui_ipc.ScreenState) {
+			trace.recordMode(st.Mode)
+			devDisplay.ObserveState(st)
+		},
 		MockHealth:               printer.DevPrinterHealth,
 		CompletedDisplayDuration: 1 * time.Second,
 	}
@@ -242,10 +377,18 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 		t.Fatalf("failed to create spooler client: %v", err)
 	}
 
+	var bgWg sync.WaitGroup
+	defer func() {
+		cancel()
+		bgWg.Wait()
+	}()
+
 	// 7. Start Spooler in Background
 	t.Logf("[DIAG-TEST] Initializing Spooler in background, target wsURL=%s, backendURL=%s", wsURL, server.URL)
 	clientErrCh := make(chan error, 1)
+	bgWg.Add(1)
 	go func() {
+		defer bgWg.Done()
 		clientErrCh <- client.Run(ctx)
 	}()
 
@@ -253,19 +396,15 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	requireCondition(t, 5*time.Second, func() bool {
 		select {
 		case clientErr := <-clientErrCh:
-			t.Fatalf("spooler client exited prematurely: %v", clientErr)
+			t.Fatalf("spooler client exited prematurely: %v (trace: %s)", clientErr, trace.summary())
 		default:
 		}
-		connected := activeWSConn.Load() != nil
-		if !connected {
-			t.Logf("[DIAG-TEST] requireCondition checking: activeWSConn is nil (acceptedCount=%d)", acceptedWSCount.Load())
-		}
-		return connected
-	}, "kiosk failed to connect to cloud WebSocket hub")
+		return activeWSConn.Load() != nil
+	}, "kiosk failed to connect to cloud WebSocket hub", trace)
 
 	// Verify mock hub recorded the accepted connection
 	if count := acceptedWSCount.Load(); count < 1 {
-		t.Fatalf("expected mock hub to accept at least 1 kiosk connection, got %d", count)
+		t.Fatalf("expected mock hub to accept at least 1 kiosk connection, got %d (trace: %s)", count, trace.summary())
 	}
 
 	// 8. Test Keyboard Input: Customer types PIN '0482'
@@ -274,10 +413,12 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 		t.Fatal("keypad controller is nil")
 	}
 
-	var devInputLog bytes.Buffer
-	devKeyboard := input.NewDevKeyboardAdapter(keypadCtrl, strings.NewReader("0482\n"), &devInputLog)
+	devInputLog := &syncBuffer{}
+	devKeyboard := input.NewDevKeyboardAdapter(keypadCtrl, strings.NewReader("0482\n"), devInputLog)
 
+	bgWg.Add(1)
 	go func() {
+		defer bgWg.Done()
 		_ = devKeyboard.Run(ctx)
 	}()
 
@@ -285,7 +426,26 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	requireCondition(t, 3*time.Second, func() bool {
 		st := devDisplay.GetLastState()
 		return st.Mode == ui_ipc.ModePaymentQR && st.PaymentQRURL == "https://rzp.io/i/XG-DEV-001"
-	}, "kiosk failed to display Razorpay payment QR screen")
+	}, "kiosk failed to display Razorpay payment QR screen", trace)
+
+	// Verify sanitized observability recorded the expected workflow progression
+	if !trace.hasMode(ui_ipc.ModePaymentQR) {
+		t.Fatalf("expected mode transition %s in trace: %s", ui_ipc.ModePaymentQR, trace.summary())
+	}
+	trace.mu.Lock()
+	pinCount, pinStatus, pinErr := trace.pinRedeemCount, trace.pinRedeemStatus, trace.pinRedeemErr
+	qrCount, qrStatus, qrErr := trace.qrInitCount, trace.qrInitStatus, trace.qrInitErr
+	fetchCount, fetchStatus := trace.qrFetchCount, trace.qrFetchStatus
+	trace.mu.Unlock()
+	if pinCount < 1 || pinStatus != http.StatusOK || pinErr != "" {
+		t.Fatalf("PIN redemption step incomplete or failed: count=%d status=%d err=%q (%s)", pinCount, pinStatus, pinErr, trace.summary())
+	}
+	if qrCount < 1 || qrStatus != http.StatusOK || qrErr != "" {
+		t.Fatalf("payment initiation step incomplete or failed: count=%d status=%d err=%q (%s)", qrCount, qrStatus, qrErr, trace.summary())
+	}
+	if fetchCount < 1 || fetchStatus != http.StatusOK {
+		t.Fatalf("QR retrieval step incomplete or failed: count=%d status=%d (%s)", fetchCount, fetchStatus, trace.summary())
+	}
 
 	// Check terminal output contains development indicators and amount
 	termOutput := terminalBuf.String()
@@ -301,6 +461,14 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 
 	// 10. Simulate Real Webhook Arrival: payment_link.paid verified by backend
 	isPaid.Store(true)
+
+	// Wait until at least one successful payment status poll response observes isPaid == true
+	requireCondition(t, 2*time.Second, func() bool {
+		trace.mu.Lock()
+		pollPaidCount := trace.payPollPaidCount
+		trace.mu.Unlock()
+		return pollPaidCount >= 1
+	}, "kiosk failed to poll paid payment status response", trace)
 
 	// Backend dispatches PrintJobCommand over WebSocket
 	wsConn := activeWSConn.Load()
@@ -337,13 +505,13 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 		downloadedPath := filepath.Join(downloadDir, finalName)
 		info, err := filepath.Glob(downloadedPath)
 		return err == nil && len(info) > 0
-	}, "kiosk failed to download and verify PDF payload")
+	}, "kiosk failed to download and verify PDF payload", trace)
 
 	// 12. Verify Simulated Printer Execution and Completion
 	requireCondition(t, 5*time.Second, func() bool {
 		completed, err := stateStore.IsJobCompleted(ctx, testJobID)
 		return err == nil && completed
-	}, "print job did not reach JobStatusCompleted in state store")
+	}, "print job did not reach JobStatusCompleted in state store", trace)
 
 	// 13. Verify Simulated Paper Deduction
 	sheets, err := stateStore.GetEstimatedSheets(ctx)
@@ -363,11 +531,13 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 		t.Errorf("expected physical vs simulated distinction in terminal: %s", finalTerm)
 	}
 
+	t.Logf("[ACCEPTANCE TRACE] %s", trace.summary())
+
 	// Stop client cleanly
 	cancel()
 }
 
-func requireCondition(t *testing.T, timeout time.Duration, condition func() bool, errMsg string) {
+func requireCondition(t *testing.T, timeout time.Duration, condition func() bool, errMsg string, trace *acceptanceTrace) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -375,6 +545,9 @@ func requireCondition(t *testing.T, timeout time.Duration, condition func() bool
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if trace != nil {
+		t.Fatalf("condition timed out after %s: %s (trace: %s)", timeout, errMsg, trace.summary())
 	}
 	t.Fatalf("condition timed out after %s: %s", timeout, errMsg)
 }

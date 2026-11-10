@@ -26,6 +26,7 @@ type DevDisplayConfig struct {
 	WebPort         int       // Local HTTP port for web preview (e.g. 8085; 0 to disable)
 	ConsoleWriter   io.Writer // Writer for terminal dashboard (defaults to os.Stdout)
 	DisableTerminal bool      // If true, suppresses terminal output (useful for tests)
+	DisablePNG      bool      // If true, skips PNG encoding and preview file output (useful for headless tests)
 }
 
 // DevDisplayAdapter displays kiosk screen states on a development laptop:
@@ -55,7 +56,7 @@ func NewDevDisplayAdapter(cfg DevDisplayConfig) (*DevDisplayAdapter, error) {
 		writer: cfg.ConsoleWriter,
 	}
 
-	if cfg.PreviewFile != "" {
+	if !cfg.DisablePNG && cfg.PreviewFile != "" {
 		if err := os.MkdirAll(filepath.Dir(cfg.PreviewFile), 0755); err != nil {
 			return nil, fmt.Errorf("failed to create preview directory: %w", err)
 		}
@@ -82,6 +83,13 @@ func encodeFastPNG(w io.Writer, m image.Image) error {
 func (a *DevDisplayAdapter) Sink(img *image.RGBA) error {
 	if img == nil {
 		return fmt.Errorf("image cannot be nil")
+	}
+
+	if a.cfg.DisablePNG {
+		a.mu.Lock()
+		a.latestPNG = nil
+		a.mu.Unlock()
+		return nil
 	}
 
 	var buf bytes.Buffer
