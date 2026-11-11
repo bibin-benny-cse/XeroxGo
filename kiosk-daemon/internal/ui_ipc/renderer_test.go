@@ -2,6 +2,7 @@ package ui_ipc
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -814,6 +815,429 @@ func TestConfigureAdsDynamic(t *testing.T) {
 	}
 	if img == nil {
 		t.Fatal("expected non-nil render output")
+	}
+}
+
+func TestConfigureAdsConcurrentSameThreeAds(t *testing.T) {
+	defer ConfigureAds(nil)
+
+	threeAds := []contracts.AdItem{
+		{
+			ID:          "ad-quick-easy",
+			Title:       "Quick & Easy",
+			Description: "Direct UPI payment. No coins, no cash needed.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#1E3A8A",
+			GradientC1:  "#2563EB",
+			GradientC2:  "#4F46E5",
+			SortOrder:   1,
+			IsActive:    true,
+		},
+		{
+			ID:          "ad-high-quality",
+			Title:       "High Quality Prints",
+			Description: "Crisp laser documents ready in seconds.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#065F46",
+			GradientC1:  "#10B981",
+			GradientC2:  "#059669",
+			SortOrder:   2,
+			IsActive:    true,
+		},
+		{
+			ID:          "ad-skip-queue",
+			Title:       "Skip The Queue",
+			Description: "Pick up your print job with your 4-digit code.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#581C87",
+			GradientC1:  "#7C3AED",
+			GradientC2:  "#D97706",
+			SortOrder:   3,
+			IsActive:    true,
+		},
+	}
+
+	const workers = 16
+	const iterations = 25
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				ConfigureAds(threeAds)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if count := GetAdSlideCount(); count != 3 {
+		t.Fatalf("expected 3 ad slides after concurrent ConfigureAds, got %d", count)
+	}
+	for idx := 0; idx < 3; idx++ {
+		slide := GetAdSlideImage(idx)
+		if slide == nil {
+			t.Fatalf("expected non-nil slide image at index %d", idx)
+		}
+		if slide.Bounds().Dx() != 1220 || slide.Bounds().Dy() != 910 {
+			t.Fatalf("unexpected slide %d bounds: %v", idx, slide.Bounds())
+		}
+	}
+}
+
+func TestConfigureAdsConcurrentWithRenderTo(t *testing.T) {
+	defer ConfigureAds(nil)
+	initUIAssets()
+
+	adsA := []contracts.AdItem{
+		{
+			ID:          "ad-a1",
+			Title:       "WWQQMM@@88 Quick & Easy",
+			Description: "iiii....llll!!!! Direct UPI payment ready in seconds.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#1E3A8A",
+			GradientC1:  "#2563EB",
+			GradientC2:  "#4F46E5",
+			SortOrder:   1,
+			IsActive:    true,
+		},
+		{
+			ID:          "ad-a2",
+			Title:       "High Quality Prints @ 1200 DPI",
+			Description: "Crisp laser documents ready in seconds.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#065F46",
+			GradientC1:  "#10B981",
+			GradientC2:  "#059669",
+			SortOrder:   2,
+			IsActive:    true,
+		},
+		{
+			ID:          "ad-a3",
+			Title:       "Skip The Queue",
+			Description: "Pick up your print job with your 4-digit code.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#581C87",
+			GradientC1:  "#7C3AED",
+			GradientC2:  "#D97706",
+			SortOrder:   3,
+			IsActive:    true,
+		},
+	}
+
+	adsB := []contracts.AdItem{
+		{
+			ID:          "ad-b1",
+			Title:       "i.i.l.l! Tiny Narrow Glyphs",
+			Description: "WWWWQQQQMMMM@@@@8888 Wide glyphs in description.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#7C2D12",
+			GradientC1:  "#EA580C",
+			GradientC2:  "#F59E0B",
+			SortOrder:   1,
+			IsActive:    true,
+		},
+		{
+			ID:          "ad-b2",
+			Title:       "Campus Instant Print",
+			Description: "Secure pickup via single-use 4-digit PIN.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#0F172A",
+			GradientC1:  "#334155",
+			GradientC2:  "#1E293B",
+			SortOrder:   2,
+			IsActive:    true,
+		},
+		{
+			ID:          "ad-b3",
+			Title:       "Eco Duplex Saving",
+			Description: "Save paper with automatic double-sided printing.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#1E3A8A",
+			GradientC1:  "#2563EB",
+			GradientC2:  "#4F46E5",
+			SortOrder:   3,
+			IsActive:    true,
+		},
+	}
+
+	const adWorkers = 6
+	const renderWorkers = 6
+	const iterations = 20
+
+	start := make(chan struct{})
+	errCh := make(chan error, renderWorkers*iterations)
+	var wg sync.WaitGroup
+
+	for w := 0; w < adWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				if (workerID+i)%2 == 0 {
+					ConfigureAds(adsA)
+				} else {
+					ConfigureAds(adsB)
+				}
+			}
+		}(w)
+	}
+
+	for w := 0; w < renderWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			dst := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+			<-start
+			for i := 0; i < iterations; i++ {
+				var st ScreenState
+				switch i % 6 {
+				case 0:
+					st = ScreenState{
+						Mode:           ModeIdle,
+						QRContent:      fmt.Sprintf("https://kiosk.test/concurrent/%d/%d", workerID, i),
+						AdSlideIndex:   i % 3,
+						TransitionFrom: -1,
+					}
+				case 1:
+					st = ScreenState{
+						Mode:    ModePINEntry,
+						PIN:     fmt.Sprintf("%04d", (workerID*100+i)%10000),
+						Message: "Enter 4-digit pickup PIN",
+					}
+				case 2:
+					st = ScreenState{
+						Mode:             ModePaymentQR,
+						OrderID:          fmt.Sprintf("ord_%d_%d", workerID, i),
+						AmountPaise:      600,
+						PaymentQRURL:     "https://rzp.io/i/XG-CONCURRENT",
+						PaymentExpiresAt: time.Now().Add(10 * time.Minute),
+					}
+				case 3:
+					st = ScreenState{
+						Mode:            ModeDownloading,
+						ProgressPercent: (i * 5) % 101,
+						Detail:          "Downloading PDF document...",
+					}
+				case 4:
+					st = ScreenState{
+						Mode:        ModePrinting,
+						CurrentPage: (i % 5) + 1,
+						TotalPages:  5,
+						Detail:      "Single-sided • 1 Copy",
+					}
+				case 5:
+					st = ScreenState{
+						Mode:   ModeCompleted,
+						Detail: "5 Sheets Printed",
+					}
+				}
+				if err := RenderTo(dst, st); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(w)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("RenderTo failed during concurrent execution: %v", err)
+	}
+	if count := GetAdSlideCount(); count != 3 {
+		t.Fatalf("expected 3 ad slides after concurrent RenderTo + ConfigureAds, got %d", count)
+	}
+}
+
+func TestFontHelpersConcurrentDrawAndMeasure(t *testing.T) {
+	initUIAssets()
+
+	const workers = 12
+	const iterations = 40
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			dst := image.NewRGBA(image.Rect(0, 0, 800, 200))
+			<-start
+			for i := 0; i < iterations; i++ {
+				if (workerID+i)%2 == 0 {
+					_ = measureTextWidth(faceBold56, "WWQQMM@@88 Quick & Easy")
+					drawText(dst, faceBold56, "WWQQMM@@88 Quick & Easy", 20, 20, colorPrimaryBlue)
+					_ = measureTextWidth(faceReg28, "Pick up your print job with your 4-digit code.")
+					drawText(dst, faceReg28, "Pick up your print job with your 4-digit code.", 20, 100, colorTextPrimary)
+				} else {
+					_ = measureTextWidth(faceBold56, "iiii....llll!!!! 0482")
+					drawText(dst, faceBold56, "iiii....llll!!!! 0482", 20, 20, colorTextPrimary)
+					_ = measureTextWidth(faceReg28, "i.l!.")
+					drawText(dst, faceReg28, "i.l!.", 20, 100, colorTextSecondary)
+				}
+			}
+		}(w)
+	}
+
+	close(start)
+	wg.Wait()
+}
+
+func TestInitAdSlidesDoesNotOverwriteExplicitConfigureAds(t *testing.T) {
+	initUIAssets()
+	defer func() {
+		ConfigureTarget(FramebufferGeometry{
+			Width:        ScreenWidth,
+			Height:       ScreenHeight,
+			BitsPerPixel: 32,
+			Stride:       ScreenWidth * 4,
+		})
+		ConfigureAds(nil)
+	}()
+
+	serverAds := []contracts.AdItem{
+		{
+			ID:          "srv-orange-1",
+			Title:       "Server Promo One",
+			Description: "Custom server banner must not be replaced by defaults.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#7C2D12",
+			GradientC1:  "#EA580C",
+			GradientC2:  "#F59E0B",
+			SortOrder:   1,
+			IsActive:    true,
+		},
+		{
+			ID:          "srv-orange-2",
+			Title:       "Server Promo Two",
+			Description: "Active promotional configuration from cloud.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#9A3412",
+			GradientC1:  "#F97316",
+			GradientC2:  "#FBBF24",
+			SortOrder:   2,
+			IsActive:    true,
+		},
+		{
+			ID:          "srv-orange-3",
+			Title:       "Server Promo Three",
+			Description: "Verified server-provided ad slide.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#7C2D12",
+			GradientC1:  "#EA580C",
+			GradientC2:  "#F59E0B",
+			SortOrder:   3,
+			IsActive:    true,
+		},
+	}
+
+	const rounds = 15
+	for round := 0; round < rounds; round++ {
+		ConfigureTarget(FramebufferGeometry{
+			Width:        ScreenWidth,
+			Height:       ScreenHeight,
+			BitsPerPixel: 32,
+			Stride:       ScreenWidth * 4,
+		})
+
+		// Reset to an empty ad slide state before launching concurrent callers.
+		adSlidesMu.Lock()
+		adSlideImgs = nil
+		scaledAdSlideImgs = nil
+		lastAdConfigSeq = 0
+		adSlidesMu.Unlock()
+
+		start := make(chan struct{})
+		errCh := make(chan error, 8)
+		var wg sync.WaitGroup
+
+		// Default initialization workers racing against explicit server ads
+		for w := 0; w < 2; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				initAdSlides()
+			}()
+		}
+
+		// Explicit server ad configuration
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ConfigureAds(serverAds)
+		}()
+
+		// Overlapping RenderTo calls across Idle and non-Idle modes
+		for w := 0; w < 2; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				dst := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+				<-start
+				for i := 0; i < 4; i++ {
+					if err := RenderTo(dst, ScreenState{
+						Mode:           ModeIdle,
+						QRContent:      fmt.Sprintf("https://kiosk.test/init-race/%d/%d/%d", round, workerID, i),
+						AdSlideIndex:   i % 3,
+						TransitionFrom: -1,
+					}); err != nil {
+						errCh <- err
+						return
+					}
+					if err := RenderTo(dst, ScreenState{
+						Mode:    ModePINEntry,
+						PIN:     "0482",
+						Message: "Enter 4-digit pickup PIN",
+					}); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}(w)
+		}
+
+		// Concurrent target geometry configuration (verify no deadlock with ConfigureTarget)
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			<-start
+			if r%2 == 0 {
+				ConfigureTarget(FramebufferGeometry{Width: 1280, Height: 720, BitsPerPixel: 32, Stride: 1280 * 4})
+			} else {
+				ConfigureTarget(FramebufferGeometry{Width: ScreenWidth, Height: ScreenHeight, BitsPerPixel: 32, Stride: ScreenWidth * 4})
+			}
+		}(round)
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			t.Fatalf("round %d: RenderTo failed: %v", round, err)
+		}
+
+		if count := GetAdSlideCount(); count != 3 {
+			t.Fatalf("round %d: expected 3 active server ad slides, got %d", round, count)
+		}
+		slide0 := GetAdSlideImage(0)
+		if slide0 == nil {
+			t.Fatalf("round %d: GetAdSlideImage(0) returned nil", round)
+		}
+		// Server slide 0 uses warm orange (#EA580C), whereas default slide 0 uses blue (#2563EB).
+		centerPixel := slide0.RGBAAt(600, 450)
+		if centerPixel.R < 180 || centerPixel.B > 60 {
+			t.Fatalf("round %d: expected server ad slide (orange, R>180 B<60) to remain active, got default/other pixel %v", round, centerPixel)
+		}
 	}
 }
 

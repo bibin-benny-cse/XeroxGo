@@ -24,27 +24,36 @@ var fontBoldBytes []byte
 //go:embed assets/logo.png
 var logoPNGBytes []byte
 
+// guardedFace serializes all font.Face operations on a single shared face.
+// Implementations like opentype.Face reuse internal scratch buffers and glyph mask
+// storage across calls, so glyph lookup + rasterization + drawing and text measurement
+// must hold mu for the full operation.
+type guardedFace struct {
+	mu   sync.Mutex
+	face font.Face
+}
+
 var (
 	assetsOnce sync.Once
 
-	faceReg16 font.Face
-	faceReg18 font.Face
-	faceReg20 font.Face
-	faceReg22 font.Face
-	faceReg24 font.Face
-	faceReg28 font.Face
-	faceReg32 font.Face
+	faceReg16 *guardedFace
+	faceReg18 *guardedFace
+	faceReg20 *guardedFace
+	faceReg22 *guardedFace
+	faceReg24 *guardedFace
+	faceReg28 *guardedFace
+	faceReg32 *guardedFace
 
-	faceBold18 font.Face
-	faceBold20 font.Face
-	faceBold22 font.Face
-	faceBold24 font.Face
-	faceBold28 font.Face
-	faceBold32 font.Face
-	faceBold36 font.Face
-	faceBold44 font.Face
-	faceBold48 font.Face
-	faceBold56 font.Face
+	faceBold18 *guardedFace
+	faceBold20 *guardedFace
+	faceBold22 *guardedFace
+	faceBold24 *guardedFace
+	faceBold28 *guardedFace
+	faceBold32 *guardedFace
+	faceBold36 *guardedFace
+	faceBold44 *guardedFace
+	faceBold48 *guardedFace
+	faceBold56 *guardedFace
 
 	rawLogoImg image.Image
 )
@@ -61,7 +70,7 @@ func initUIAssets() {
 			panic("failed to parse Inter-Bold: " + err.Error())
 		}
 
-		makeFace := func(f *opentype.Font, size float64) font.Face {
+		makeFace := func(f *opentype.Font, size float64) *guardedFace {
 			face, err := opentype.NewFace(f, &opentype.FaceOptions{
 				Size:    size,
 				DPI:     72,
@@ -70,7 +79,7 @@ func initUIAssets() {
 			if err != nil {
 				panic("failed to create face: " + err.Error())
 			}
-			return face
+			return &guardedFace{face: face}
 		}
 
 		faceReg16 = makeFace(fReg, 16)
@@ -164,26 +173,32 @@ func maskCardCorners(dst *image.RGBA, r image.Rectangle, radius int, bg color.RG
 }
 
 // drawText renders text starting at top-left position (x, y) using the given font face and color.
-func drawText(dst *image.RGBA, face font.Face, text string, x, y int, col color.RGBA) {
-	if face == nil || len(text) == 0 {
+func drawText(dst *image.RGBA, gf *guardedFace, text string, x, y int, col color.RGBA) {
+	if gf == nil || gf.face == nil || len(text) == 0 {
 		return
 	}
-	ascent := face.Metrics().Ascent.Ceil()
+	gf.mu.Lock()
+	defer gf.mu.Unlock()
+
+	ascent := gf.face.Metrics().Ascent.Ceil()
 	d := &font.Drawer{
 		Dst:  dst,
 		Src:  image.NewUniform(col),
-		Face: face,
+		Face: gf.face,
 		Dot:  fixed.Point26_6{X: fixed.I(x), Y: fixed.I(y + ascent)},
 	}
 	d.DrawString(text)
 }
 
 // measureTextWidth returns the horizontal pixel width of the text with the given face.
-func measureTextWidth(face font.Face, text string) int {
-	if face == nil || len(text) == 0 {
+func measureTextWidth(gf *guardedFace, text string) int {
+	if gf == nil || gf.face == nil || len(text) == 0 {
 		return 0
 	}
-	d := &font.Drawer{Face: face}
+	gf.mu.Lock()
+	defer gf.mu.Unlock()
+
+	d := &font.Drawer{Face: gf.face}
 	return d.MeasureString(text).Ceil()
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"image"
 	"io"
 	"net"
@@ -1524,4 +1525,201 @@ func TestClientResetsToIdleAfterCompletion(t *testing.T) {
 	if !resetSeen {
 		t.Fatal("expected kiosk screen to reset to ModeIdle after completion duration")
 	}
+}
+
+func TestClientConcurrentSyncAdsAndDeduplication(t *testing.T) {
+	defer ui_ipc.ConfigureAds(nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "ads_sync.db")
+	cachePath := filepath.Join(tmpDir, "ads_cache.json")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ts := time.Date(2026, 11, 11, 6, 30, 0, 0, time.UTC)
+	threeAds := []contracts.AdItem{
+		{
+			ID:          "ad-quick-easy",
+			Title:       "Quick & Easy",
+			Description: "Direct UPI payment. No coins, no cash needed.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#1E3A8A",
+			GradientC1:  "#2563EB",
+			GradientC2:  "#4F46E5",
+			SortOrder:   1,
+			IsActive:    true,
+			UpdatedAt:   ts,
+		},
+		{
+			ID:          "ad-high-quality",
+			Title:       "High Quality Prints",
+			Description: "Crisp laser documents ready in seconds.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#065F46",
+			GradientC1:  "#10B981",
+			GradientC2:  "#059669",
+			SortOrder:   2,
+			IsActive:    true,
+			UpdatedAt:   ts,
+		},
+		{
+			ID:          "ad-skip-queue",
+			Title:       "Skip The Queue",
+			Description: "Pick up your print job with your 4-digit code.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#581C87",
+			GradientC1:  "#7C3AED",
+			GradientC2:  "#D97706",
+			SortOrder:   3,
+			IsActive:    true,
+			UpdatedAt:   ts,
+		},
+	}
+
+	updatedTwoAds := []contracts.AdItem{
+		{
+			ID:          "ad-updated-1",
+			Title:       "Updated Promo 1",
+			Description: "Fresh promotional campaign.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#7C2D12",
+			GradientC1:  "#EA580C",
+			GradientC2:  "#F59E0B",
+			SortOrder:   1,
+			IsActive:    true,
+			UpdatedAt:   ts.Add(time.Minute),
+		},
+		{
+			ID:          "ad-updated-2",
+			Title:       "Updated Promo 2",
+			Description: "Second updated banner.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#0F172A",
+			GradientC1:  "#334155",
+			GradientC2:  "#1E293B",
+			SortOrder:   2,
+			IsActive:    true,
+			UpdatedAt:   ts.Add(time.Minute),
+		},
+	}
+
+	var restCalls atomic.Int32
+	wsConnected := make(chan struct{})
+	var wsOnce sync.Once
+	triggerSecondUpdate := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/ads":
+			restCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(threeAds)
+		case "/ws":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			wsOnce.Do(func() { close(wsConnected) })
+
+			// Push identical 3-ad sync_ads updates back-to-back while fetchInitialAds runs
+			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: threeAds})
+			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: threeAds})
+
+			select {
+			case <-triggerSecondUpdate:
+				_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: updatedTwoAds})
+			case <-ctx.Done():
+				return
+			}
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(ctx, conn, &msg); err != nil {
+					return
+				}
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      wsURL,
+		KioskID:       "kiosk-ads-sync",
+		StateStore:    store,
+		PrinterAddr:   "127.0.0.1:9100",
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://kiosk.test/ads",
+		AdsCachePath:  cachePath,
+		ScreenSink:    noopSink,
+		HTTPClient:    srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- client.Run(runCtx)
+	}()
+
+	select {
+	case <-wsConnected:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for WebSocket connection")
+	}
+
+	// Wait until ads_cache.json contains the initial 3 ads
+	deadline := time.Now().Add(3 * time.Second)
+	var cached []contracts.AdItem
+	for time.Now().Before(deadline) {
+		var loadErr error
+		cached, loadErr = loadAdsCache(cachePath)
+		if loadErr == nil && len(cached) == 3 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if len(cached) != 3 {
+		t.Fatalf("expected 3 cached ads after initial REST + WS sync, got %d", len(cached))
+	}
+
+	// Verify concurrent identical calls do not alter cache contents or panic
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client.handleSyncAds(threeAds)
+		}()
+	}
+	wg.Wait()
+
+	// Trigger a distinct ad update over WebSocket and confirm propagation
+	close(triggerSecondUpdate)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		cached, _ = loadAdsCache(cachePath)
+		if len(cached) == 2 && ui_ipc.GetAdSlideCount() == 2 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if len(cached) != 2 || ui_ipc.GetAdSlideCount() != 2 {
+		t.Fatalf("expected updated 2-ad sync to propagate, cache=%d slides=%d", len(cached), ui_ipc.GetAdSlideCount())
+	}
+
+	runCancel()
+	<-doneCh
 }

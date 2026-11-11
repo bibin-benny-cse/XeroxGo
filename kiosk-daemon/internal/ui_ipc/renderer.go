@@ -15,11 +15,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 	xdraw "golang.org/x/image/draw"
-	"golang.org/x/image/font"
 	_ "golang.org/x/image/webp"
 	"xeroxgo/pkg/contracts"
 )
@@ -306,6 +306,8 @@ var (
 	}
 
 	adSlidesMu           sync.RWMutex
+	adConfigSeq          atomic.Uint64
+	lastAdConfigSeq      uint64
 	adSlideImgs          []*image.RGBA
 	scaledAdSlideImgs    []*image.RGBA
 	cachedScaledIdleBase *image.RGBA
@@ -416,10 +418,10 @@ func GetAdSlideImage(idx int) *image.RGBA {
 // CPU or memory allocation overhead during 60 FPS idle animation loops.
 func ConfigureAds(items []contracts.AdItem) {
 	initUIAssets()
-	configureAdsInternal(items)
+	configureAdsInternal(items, adConfigSeq.Add(1))
 }
 
-func configureAdsInternal(items []contracts.AdItem) {
+func configureAdsInternal(items []contracts.AdItem, seq uint64) {
 	var active []contracts.AdItem
 	for _, it := range items {
 		if it.IsActive {
@@ -436,9 +438,9 @@ func configureAdsInternal(items []contracts.AdItem) {
 	}
 
 	targetGeomMu.RLock()
-	geom := targetGeom
-	targetGeomMu.RUnlock()
+	defer targetGeomMu.RUnlock()
 
+	geom := targetGeom
 	var newScaled []*image.RGBA
 	if geom.Width != ScreenWidth || geom.Height != ScreenHeight {
 		sx := float64(geom.Width) / float64(ScreenWidth)
@@ -460,8 +462,17 @@ func configureAdsInternal(items []contracts.AdItem) {
 	}
 
 	adSlidesMu.Lock()
-	adSlideImgs = newImgs
-	scaledAdSlideImgs = newScaled
+	if seq == 0 {
+		// Default initialization must never supersede an existing or in-flight explicit configuration.
+		if len(adSlideImgs) == 0 && lastAdConfigSeq == 0 {
+			adSlideImgs = newImgs
+			scaledAdSlideImgs = newScaled
+		}
+	} else if seq > lastAdConfigSeq {
+		lastAdConfigSeq = seq
+		adSlideImgs = newImgs
+		scaledAdSlideImgs = newScaled
+	}
 	adSlidesMu.Unlock()
 }
 
@@ -517,9 +528,13 @@ func parseHexColorDefault(hexStr string, def color.RGBA) color.RGBA {
 }
 
 // initAdSlides pre-renders promotional slides into memory buffers once at startup.
+// Sequence 0 ensures default initialization cannot supersede an explicit ConfigureAds call.
 func initAdSlides() {
-	if len(adSlideImgs) == 0 {
-		configureAdsInternal(defaultAdItems)
+	adSlidesMu.RLock()
+	empty := len(adSlideImgs) == 0 && lastAdConfigSeq == 0
+	adSlidesMu.RUnlock()
+	if empty {
+		configureAdsInternal(defaultAdItems, 0)
 	}
 }
 
@@ -1297,7 +1312,7 @@ func strokeRect(dst *image.RGBA, r image.Rectangle, thickness int, col color.RGB
 
 func drawTextScaled(dst *image.RGBA, text string, startX, startY, scale int, col color.RGBA) {
 	initUIAssets()
-	var face font.Face
+	var face *guardedFace
 	switch scale {
 	case 1:
 		face = faceReg16

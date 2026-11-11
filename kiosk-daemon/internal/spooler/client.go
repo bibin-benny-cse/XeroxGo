@@ -117,6 +117,10 @@ type Client struct {
 	renderMu sync.Mutex
 	canvas   *image.RGBA
 
+	adsSyncMu     sync.Mutex
+	hasSyncedAds  bool
+	lastSyncedAds []contracts.AdItem
+
 	healthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 }
 
@@ -252,9 +256,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.AdsCachePath == "" {
 		cfg.AdsCachePath = "/var/kiosk/ads_cache.json"
 	}
+	var (
+		hasSyncedAds  bool
+		lastSyncedAds []contracts.AdItem
+	)
 	if cached, err := loadAdsCache(cfg.AdsCachePath); err == nil && len(cached) > 0 {
 		log.Printf("[SPOOLER] Loaded %d promotional ads from local cache %s", len(cached), cfg.AdsCachePath)
 		ui_ipc.ConfigureAds(cached)
+		hasSyncedAds = true
+		lastSyncedAds = cloneAdItems(cached)
 	}
 
 	backendURL := strings.TrimSpace(cfg.BackendBaseURL)
@@ -295,6 +305,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		maxBackoff:        maxBackoff,
 		heartbeatInterval: hbInterval,
 		maxDownloadBytes:  250 * 1024 * 1024,
+		hasSyncedAds:      hasSyncedAds,
+		lastSyncedAds:     lastSyncedAds,
 		healthPoller:      poller,
 	}
 
@@ -1245,9 +1257,51 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 }
 
 func (c *Client) handleSyncAds(ads []contracts.AdItem) {
-	log.Printf("[SPOOLER] Received sync_ads push with %d items", len(ads))
-	ui_ipc.ConfigureAds(ads)
-	go saveAdsCache(c.cfg.AdsCachePath, ads)
+	c.adsSyncMu.Lock()
+	defer c.adsSyncMu.Unlock()
+
+	if c.hasSyncedAds && adItemsEqual(c.lastSyncedAds, ads) {
+		return
+	}
+
+	cloned := cloneAdItems(ads)
+	log.Printf("[SPOOLER] Received sync_ads push with %d items", len(cloned))
+	ui_ipc.ConfigureAds(cloned)
+	saveAdsCache(c.cfg.AdsCachePath, cloned)
+	c.lastSyncedAds = cloned
+	c.hasSyncedAds = true
+}
+
+func cloneAdItems(items []contracts.AdItem) []contracts.AdItem {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]contracts.AdItem, len(items))
+	copy(out, items)
+	return out
+}
+
+func adItemsEqual(a, b []contracts.AdItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID ||
+			a[i].Title != b[i].Title ||
+			a[i].Description != b[i].Description ||
+			a[i].Type != b[i].Type ||
+			a[i].ImageURL != b[i].ImageURL ||
+			a[i].GradientC0 != b[i].GradientC0 ||
+			a[i].GradientC1 != b[i].GradientC1 ||
+			a[i].GradientC2 != b[i].GradientC2 ||
+			a[i].LinkURL != b[i].LinkURL ||
+			a[i].SortOrder != b[i].SortOrder ||
+			a[i].IsActive != b[i].IsActive ||
+			!a[i].UpdatedAt.Equal(b[i].UpdatedAt) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) fetchInitialAds() {
@@ -1285,12 +1339,34 @@ func saveAdsCache(path string, ads []contracts.AdItem) {
 		return
 	}
 	dir := filepath.Dir(path)
-	_ = os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
 	data, err := json.MarshalIndent(ads, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0644)
+	tmp, err := os.CreateTemp(dir, "ads_cache_*.json.tmp")
+	if err != nil {
+		_ = os.WriteFile(path, data, 0644)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(path)
+		if err2 := os.Rename(tmpName, path); err2 != nil {
+			_ = os.Remove(tmpName)
+		}
+	}
 }
 
 func loadAdsCache(path string) ([]contracts.AdItem, error) {
