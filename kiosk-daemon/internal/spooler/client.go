@@ -39,6 +39,15 @@ type wireMessage struct {
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 }
 
+// DiagnosticEvent captures a sanitized workflow or render milestone for observability.
+// It never includes customer PINs, request headers, or authentication credentials.
+type DiagnosticEvent struct {
+	Stage      string
+	Mode       ui_ipc.ScreenMode
+	DigitCount int
+	Duration   time.Duration
+}
+
 // ClientConfig holds the runtime dependencies and parameters for the kiosk spooler client.
 type ClientConfig struct {
 	CloudURL                 string
@@ -61,6 +70,7 @@ type ClientConfig struct {
 	ErrorDisplayDuration     time.Duration
 	ScreenSink               ui_ipc.Sink
 	StateObserver            func(state ui_ipc.ScreenState)
+	DiagnosticObserver       func(event DiagnosticEvent)
 	HTTPClient               *http.Client
 	RootCAPath               string
 	MinBackoff               time.Duration
@@ -290,10 +300,17 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	client.keypadCtrl = input.NewController(input.Config{
 		OnChange: func(currentPIN string) {
+			start := time.Now()
 			_ = client.renderScreen(ui_ipc.ScreenState{
 				Mode:    ui_ipc.ModePINEntry,
 				PIN:     currentPIN,
 				Message: "Enter your 4-digit pickup PIN",
+			})
+			client.emitDiag(DiagnosticEvent{
+				Stage:      "pin_change_done",
+				Mode:       ui_ipc.ModePINEntry,
+				DigitCount: len(currentPIN),
+				Duration:   time.Since(start),
 			})
 		},
 		OnCancel: func() {
@@ -304,8 +321,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			})
 		},
 		OnSubmit: func(ctx context.Context, pin string) error {
+			client.emitDiag(DiagnosticEvent{Stage: "submit_reached"})
+			submitStart := time.Now()
 			session := NewKioskWorkflowSession(client)
-			return session.ExecuteWorkflow(ctx, pin)
+			err := session.ExecuteWorkflow(ctx, pin)
+			client.emitDiag(DiagnosticEvent{
+				Stage:    "submit_done",
+				Duration: time.Since(submitStart),
+			})
+			return err
 		},
 	})
 
@@ -1046,6 +1070,12 @@ func (c *Client) renderInitialIdleIfUnset(ctx context.Context) {
 	})
 }
 
+func (c *Client) emitDiag(ev DiagnosticEvent) {
+	if c.cfg.DiagnosticObserver != nil {
+		c.cfg.DiagnosticObserver(ev)
+	}
+}
+
 func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 	c.renderMu.Lock()
 	defer c.renderMu.Unlock()
@@ -1054,6 +1084,9 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 
 // renderScreenLocked executes the screen transition while c.renderMu is held by the caller.
 func (c *Client) renderScreenLocked(state ui_ipc.ScreenState) error {
+	renderStart := time.Now()
+	c.emitDiag(DiagnosticEvent{Stage: "render_start", Mode: state.Mode})
+
 	if state.PrinterModel == "" && c.cfg.PrinterModel != "" {
 		state.PrinterModel = c.cfg.PrinterModel
 	}
@@ -1083,18 +1116,28 @@ func (c *Client) renderScreenLocked(state ui_ipc.ScreenState) error {
 		c.canvas = image.NewRGBA(image.Rect(0, 0, targetW, targetH))
 	}
 
+	c.emitDiag(DiagnosticEvent{Stage: "render_to_start", Mode: state.Mode})
+	renderToStart := time.Now()
 	if err := ui_ipc.RenderTo(c.canvas, state); err != nil {
 		c.lastRenderErrMu.Lock()
 		c.lastRenderErr = err
 		c.lastRenderErrMu.Unlock()
+		c.emitDiag(DiagnosticEvent{Stage: "render_error", Mode: state.Mode, Duration: time.Since(renderStart)})
 		return err
 	}
+	c.emitDiag(DiagnosticEvent{Stage: "render_to_done", Mode: state.Mode, Duration: time.Since(renderToStart)})
+
+	c.emitDiag(DiagnosticEvent{Stage: "screen_sink_start", Mode: state.Mode})
+	sinkStart := time.Now()
 	if err := c.cfg.ScreenSink(c.canvas); err != nil {
 		c.lastRenderErrMu.Lock()
 		c.lastRenderErr = err
 		c.lastRenderErrMu.Unlock()
+		c.emitDiag(DiagnosticEvent{Stage: "render_error", Mode: state.Mode, Duration: time.Since(renderStart)})
 		return err
 	}
+	c.emitDiag(DiagnosticEvent{Stage: "screen_sink_done", Mode: state.Mode, Duration: time.Since(sinkStart)})
+	c.emitDiag(DiagnosticEvent{Stage: "render_done", Mode: state.Mode, Duration: time.Since(renderStart)})
 	return nil
 }
 

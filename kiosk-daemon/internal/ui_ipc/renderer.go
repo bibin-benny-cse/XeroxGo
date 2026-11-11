@@ -1242,20 +1242,27 @@ func drawProgressBar(dst *image.RGBA, x, y, width, height, current, total int, f
 }
 
 func fillRect(dst *image.RGBA, r image.Rectangle, col color.RGBA) {
+	if dst == nil {
+		return
+	}
 	r = r.Intersect(dst.Bounds())
 	if r.Empty() || col.A == 0 {
 		return
 	}
+	rowBytes := r.Dx() * 4
 	if col.A == 255 {
-		for y := r.Min.Y; y < r.Max.Y; y++ {
-			rowStart := y*dst.Stride + r.Min.X*4
-			rowEnd := y*dst.Stride + r.Max.X*4
-			for p := rowStart; p < rowEnd; p += 4 {
-				dst.Pix[p+0] = col.R
-				dst.Pix[p+1] = col.G
-				dst.Pix[p+2] = col.B
-				dst.Pix[p+3] = 255
-			}
+		firstOff := dst.PixOffset(r.Min.X, r.Min.Y)
+		firstRow := dst.Pix[firstOff : firstOff+rowBytes]
+		firstRow[0] = col.R
+		firstRow[1] = col.G
+		firstRow[2] = col.B
+		firstRow[3] = 255
+		for bp := 4; bp < rowBytes; bp *= 2 {
+			copy(firstRow[bp:], firstRow[:bp])
+		}
+		for y := r.Min.Y + 1; y < r.Max.Y; y++ {
+			off := dst.PixOffset(r.Min.X, y)
+			copy(dst.Pix[off:off+rowBytes], firstRow)
 		}
 		return
 	}
@@ -1267,13 +1274,13 @@ func fillRect(dst *image.RGBA, r image.Rectangle, col color.RGBA) {
 	bF := float64(col.B) * alpha
 
 	for y := r.Min.Y; y < r.Max.Y; y++ {
-		rowStart := y*dst.Stride + r.Min.X*4
-		rowEnd := y*dst.Stride + r.Max.X*4
-		for p := rowStart; p < rowEnd; p += 4 {
-			dst.Pix[p+0] = uint8(rF + float64(dst.Pix[p+0])*invAlpha)
-			dst.Pix[p+1] = uint8(gF + float64(dst.Pix[p+1])*invAlpha)
-			dst.Pix[p+2] = uint8(bF + float64(dst.Pix[p+2])*invAlpha)
-			dst.Pix[p+3] = 255
+		off := dst.PixOffset(r.Min.X, y)
+		row := dst.Pix[off : off+rowBytes]
+		for p := 0; p < rowBytes; p += 4 {
+			row[p+0] = uint8(rF + float64(row[p+0])*invAlpha)
+			row[p+1] = uint8(gF + float64(row[p+1])*invAlpha)
+			row[p+2] = uint8(bF + float64(row[p+2])*invAlpha)
+			row[p+3] = 255
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,22 +52,33 @@ func (s *syncBuffer) String() string {
 // acceptanceTrace records sanitized endpoint status and screen mode transitions
 // safely across background handlers without calling t.Log from worker goroutines.
 type acceptanceTrace struct {
-	mu               sync.Mutex
-	wsRequests       int
-	wsStatus         int
-	wsErr            string
-	pinRedeemCount   int
-	pinRedeemStatus  int
-	pinRedeemErr     string
-	qrInitCount      int
-	qrInitStatus     int
-	qrInitErr        string
-	qrFetchCount     int
-	qrFetchStatus    int
-	payPollCount     int
-	payPollPaidCount int
-	payPollStatus    int
-	modes            []ui_ipc.ScreenMode
+	mu                 sync.Mutex
+	wsRequests         int
+	wsStatus           int
+	wsErr              string
+	pinRedeemCount     int
+	pinRedeemStatus    int
+	pinRedeemErr       string
+	qrInitCount        int
+	qrInitStatus       int
+	qrInitErr          string
+	qrFetchCount       int
+	qrFetchStatus      int
+	payPollCount       int
+	payPollPaidCount   int
+	payPollStatus      int
+	modes              []ui_ipc.ScreenMode
+	pinDigitsCompleted int
+	pin4DigitsReturned bool
+	submitReached      bool
+	submitReturned     bool
+	keyboardExited     bool
+	renderInProgress   ui_ipc.ScreenMode
+	renderStage        string
+	renderStartTime    time.Time
+	lastRenderToDur    time.Duration
+	lastSinkDur        time.Duration
+	renderDurations    []string
 }
 
 func (tr *acceptanceTrace) recordWS(status int, errMsg string) {
@@ -116,6 +128,57 @@ func (tr *acceptanceTrace) recordMode(mode ui_ipc.ScreenMode) {
 	tr.modes = append(tr.modes, mode)
 }
 
+func (tr *acceptanceTrace) recordDiagnostic(ev spooler.DiagnosticEvent) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	switch ev.Stage {
+	case "pin_change_done":
+		if ev.DigitCount > tr.pinDigitsCompleted {
+			tr.pinDigitsCompleted = ev.DigitCount
+		}
+		if ev.DigitCount == 4 {
+			tr.pin4DigitsReturned = true
+		}
+	case "submit_reached":
+		tr.submitReached = true
+	case "submit_done":
+		tr.submitReturned = true
+	case "render_start":
+		tr.renderInProgress = ev.Mode
+		tr.renderStage = "observe"
+		tr.renderStartTime = time.Now()
+		tr.lastRenderToDur = 0
+		tr.lastSinkDur = 0
+	case "render_to_start":
+		tr.renderStage = "render_to"
+	case "render_to_done":
+		tr.lastRenderToDur = ev.Duration
+	case "screen_sink_start":
+		tr.renderStage = "screen_sink"
+	case "screen_sink_done":
+		tr.lastSinkDur = ev.Duration
+	case "render_done":
+		tr.renderDurations = append(tr.renderDurations, fmt.Sprintf(
+			"%s(renderTo=%s,sink=%s,total=%s)",
+			ev.Mode, tr.lastRenderToDur.Round(time.Millisecond), tr.lastSinkDur.Round(time.Millisecond), ev.Duration.Round(time.Millisecond),
+		))
+		tr.renderInProgress = ""
+		tr.renderStage = ""
+	case "render_error":
+		tr.renderDurations = append(tr.renderDurations, fmt.Sprintf(
+			"%s(ERR,total=%s)", ev.Mode, ev.Duration.Round(time.Millisecond),
+		))
+		tr.renderInProgress = ""
+		tr.renderStage = ""
+	}
+}
+
+func (tr *acceptanceTrace) recordKeyboardExited() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.keyboardExited = true
+}
+
 func (tr *acceptanceTrace) hasMode(target ui_ipc.ScreenMode) bool {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -134,14 +197,19 @@ func (tr *acceptanceTrace) summary() string {
 	for i, m := range tr.modes {
 		modeNames[i] = string(m)
 	}
+	inProgress := "none"
+	if tr.renderInProgress != "" {
+		inProgress = fmt.Sprintf("%s/%s(elapsed=%s)", tr.renderInProgress, tr.renderStage, time.Since(tr.renderStartTime).Round(time.Millisecond))
+	}
 	return fmt.Sprintf(
-		"ws(req=%d,status=%d,err=%q) pin_redeem(calls=%d,status=%d,err=%q) qr_init(calls=%d,status=%d,err=%q) qr_fetch(calls=%d,status=%d) pay_poll(calls=%d,paid=%d,status=%d) modes=%v",
+		"ws(req=%d,status=%d,err=%q) pin_redeem(calls=%d,status=%d,err=%q) qr_init(calls=%d,status=%d,err=%q) qr_fetch(calls=%d,status=%d) pay_poll(calls=%d,paid=%d,status=%d) input(digits_done=%d,4digits_returned=%v,submit_reached=%v,submit_done=%v,kbd_exit=%v) render_in_progress=%s render_durs=%v modes=%v",
 		tr.wsRequests, tr.wsStatus, tr.wsErr,
 		tr.pinRedeemCount, tr.pinRedeemStatus, tr.pinRedeemErr,
 		tr.qrInitCount, tr.qrInitStatus, tr.qrInitErr,
 		tr.qrFetchCount, tr.qrFetchStatus,
 		tr.payPollCount, tr.payPollPaidCount, tr.payPollStatus,
-		modeNames,
+		tr.pinDigitsCompleted, tr.pin4DigitsReturned, tr.submitReached, tr.submitReturned, tr.keyboardExited,
+		inProgress, tr.renderDurations, modeNames,
 	)
 }
 
@@ -368,6 +436,7 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 			trace.recordMode(st.Mode)
 			devDisplay.ObserveState(st)
 		},
+		DiagnosticObserver:       trace.recordDiagnostic,
 		MockHealth:               printer.DevPrinterHealth,
 		CompletedDisplayDuration: 1 * time.Second,
 	}
@@ -420,6 +489,7 @@ func TestWindowsDevMode_FullAcceptanceWorkflow(t *testing.T) {
 	go func() {
 		defer bgWg.Done()
 		_ = devKeyboard.Run(ctx)
+		trace.recordKeyboardExited()
 	}()
 
 	// 9. Verify Payment Link & QR are displayed on laptop screen
@@ -546,6 +616,9 @@ func requireCondition(t *testing.T, timeout time.Duration, condition func() bool
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	stackBuf := make([]byte, 64*1024)
+	n := runtime.Stack(stackBuf, true)
+	t.Logf("[GOROUTINE STACKS ON TIMEOUT]\n%s", string(stackBuf[:n]))
 	if trace != nil {
 		t.Fatalf("condition timed out after %s: %s (trace: %s)", timeout, errMsg, trace.summary())
 	}

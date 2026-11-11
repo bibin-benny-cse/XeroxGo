@@ -579,9 +579,52 @@ func drawCircle(dst *image.RGBA, cx, cy, radius int, col color.RGBA) {
 	fillRoundedRect(dst, r, radius, col)
 }
 
+type logoCacheKey struct {
+	width  int
+	height int
+}
+
+var (
+	scaledLogoMu    sync.RWMutex
+	scaledLogoCache = make(map[logoCacheKey]*image.RGBA64)
+)
+
+// getScaledLogo returns an immutable pre-scaled 16-bit RGBA64 logo image for the given
+// target dimensions. Storing 16-bit premultiplied channels preserves exact x/image/draw
+// bilinear precision for zero-diff Over compositing onto arbitrary dst images.
+func getScaledLogo(targetWidth, targetHeight int) *image.RGBA64 {
+	if rawLogoImg == nil || targetWidth <= 0 || targetHeight <= 0 {
+		return nil
+	}
+	b := rawLogoImg.Bounds()
+	if b.Empty() {
+		return nil
+	}
+
+	key := logoCacheKey{width: targetWidth, height: targetHeight}
+	scaledLogoMu.RLock()
+	cached := scaledLogoCache[key]
+	scaledLogoMu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+
+	scaled := image.NewRGBA64(image.Rect(0, 0, targetWidth, targetHeight))
+	draw.BiLinear.Scale(scaled, scaled.Bounds(), rawLogoImg, b, draw.Src, nil)
+
+	scaledLogoMu.Lock()
+	if existing := scaledLogoCache[key]; existing != nil {
+		scaledLogoMu.Unlock()
+		return existing
+	}
+	scaledLogoCache[key] = scaled
+	scaledLogoMu.Unlock()
+	return scaled
+}
+
 // drawLogo scales and draws the embedded XeroxGo logo into dst at (x, y) with the specified target height.
 func drawLogo(dst *image.RGBA, x, y, targetHeight int) {
-	if rawLogoImg == nil {
+	if dst == nil || rawLogoImg == nil || targetHeight <= 0 {
 		return
 	}
 	b := rawLogoImg.Bounds()
@@ -589,8 +632,52 @@ func drawLogo(dst *image.RGBA, x, y, targetHeight int) {
 		return
 	}
 	targetWidth := (targetHeight * b.Dx()) / b.Dy()
+	if targetWidth <= 0 {
+		return
+	}
+	scaled := getScaledLogo(targetWidth, targetHeight)
+	if scaled == nil {
+		return
+	}
+
 	dstRect := image.Rect(x, y, x+targetWidth, y+targetHeight)
-	draw.BiLinear.Scale(dst, dstRect, rawLogoImg, b, draw.Over, nil)
+	clipped := dstRect.Intersect(dst.Bounds())
+	if clipped.Empty() {
+		return
+	}
+
+	srcStartX := clipped.Min.X - x
+	srcStartY := clipped.Min.Y - y
+	w := clipped.Dx()
+	h := clipped.Dy()
+
+	for row := 0; row < h; row++ {
+		sOff := scaled.PixOffset(srcStartX, srcStartY+row)
+		dOff := dst.PixOffset(clipped.Min.X, clipped.Min.Y+row)
+		for col := 0; col < w; col++ {
+			sp := sOff + col*8
+			dp := dOff + col*4
+			pa0 := uint32(scaled.Pix[sp+6])<<8 | uint32(scaled.Pix[sp+7])
+			if pa0 == 0 {
+				continue
+			}
+			pr0 := uint32(scaled.Pix[sp+0])<<8 | uint32(scaled.Pix[sp+1])
+			pg0 := uint32(scaled.Pix[sp+2])<<8 | uint32(scaled.Pix[sp+3])
+			pb0 := uint32(scaled.Pix[sp+4])<<8 | uint32(scaled.Pix[sp+5])
+			if pa0 == 0xffff {
+				dst.Pix[dp+0] = uint8(pr0 >> 8)
+				dst.Pix[dp+1] = uint8(pg0 >> 8)
+				dst.Pix[dp+2] = uint8(pb0 >> 8)
+				dst.Pix[dp+3] = 255
+				continue
+			}
+			pa1 := (0xffff - pa0) * 0x101
+			dst.Pix[dp+0] = uint8((uint32(dst.Pix[dp+0])*pa1/0xffff + pr0) >> 8)
+			dst.Pix[dp+1] = uint8((uint32(dst.Pix[dp+1])*pa1/0xffff + pg0) >> 8)
+			dst.Pix[dp+2] = uint8((uint32(dst.Pix[dp+2])*pa1/0xffff + pb0) >> 8)
+			dst.Pix[dp+3] = uint8((uint32(dst.Pix[dp+3])*pa1/0xffff + pa0) >> 8)
+		}
+	}
 }
 
 // drawCloseButton renders a circular close button with a crisp 2px "×" icon.

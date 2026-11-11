@@ -7,9 +7,11 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	xdraw "golang.org/x/image/draw"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -812,5 +814,325 @@ func TestConfigureAdsDynamic(t *testing.T) {
 	}
 	if img == nil {
 		t.Fatal("expected non-nil render output")
+	}
+}
+
+func seedPatternCanvas(bounds image.Rectangle, extraStride int) *image.RGBA {
+	w := bounds.Dx()
+	h := bounds.Dy()
+	stride := w*4 + extraStride
+	pix := make([]byte, h*stride)
+	img := &image.RGBA{
+		Pix:    pix,
+		Stride: stride,
+		Rect:   bounds,
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8((x*7 + y*3) & 0xFF),
+				G: uint8((x*5 + y*11) & 0xFF),
+				B: uint8((x*13 + y*17) & 0xFF),
+				A: 255,
+			})
+		}
+	}
+	return img
+}
+
+func fillRectRef(dst *image.RGBA, r image.Rectangle, col color.RGBA) {
+	if dst == nil {
+		return
+	}
+	r = r.Intersect(dst.Bounds())
+	if r.Empty() || col.A == 0 {
+		return
+	}
+	if col.A == 255 {
+		for y := r.Min.Y; y < r.Max.Y; y++ {
+			for x := r.Min.X; x < r.Max.X; x++ {
+				off := dst.PixOffset(x, y)
+				dst.Pix[off+0] = col.R
+				dst.Pix[off+1] = col.G
+				dst.Pix[off+2] = col.B
+				dst.Pix[off+3] = 255
+			}
+		}
+		return
+	}
+	alpha := float64(col.A) / 255.0
+	invAlpha := 1.0 - alpha
+	rF := float64(col.R) * alpha
+	gF := float64(col.G) * alpha
+	bF := float64(col.B) * alpha
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			off := dst.PixOffset(x, y)
+			dst.Pix[off+0] = uint8(rF + float64(dst.Pix[off+0])*invAlpha)
+			dst.Pix[off+1] = uint8(gF + float64(dst.Pix[off+1])*invAlpha)
+			dst.Pix[off+2] = uint8(bF + float64(dst.Pix[off+2])*invAlpha)
+			dst.Pix[off+3] = 255
+		}
+	}
+}
+
+func assertImagesPixelEqual(t *testing.T, label string, got, want *image.RGBA) {
+	t.Helper()
+	if got.Bounds() != want.Bounds() {
+		t.Fatalf("%s bounds mismatch: got %v, want %v", label, got.Bounds(), want.Bounds())
+	}
+	b := got.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			gp := got.RGBAAt(x, y)
+			wp := want.RGBAAt(x, y)
+			if gp != wp {
+				t.Fatalf("%s pixel mismatch at (%d,%d): got %v, want %v", label, x, y, gp, wp)
+			}
+		}
+	}
+}
+
+func TestFillRectPixelEquivalence(t *testing.T) {
+	canvases := []struct {
+		name        string
+		bounds      image.Rectangle
+		extraStride int
+		subRect     *image.Rectangle
+	}{
+		{name: "zero_origin_tight_stride", bounds: image.Rect(0, 0, 120, 80), extraStride: 0},
+		{name: "zero_origin_padded_stride", bounds: image.Rect(0, 0, 97, 65), extraStride: 36},
+		{name: "nonzero_bounds_tight_stride", bounds: image.Rect(40, 25, 160, 115), extraStride: 0},
+		{name: "nonzero_bounds_padded_stride", bounds: image.Rect(15, 20, 133, 98), extraStride: 48},
+		{
+			name:        "subimage_nonzero_and_stride",
+			bounds:      image.Rect(0, 0, 200, 160),
+			extraStride: 24,
+			subRect:     func() *image.Rectangle { r := image.Rect(30, 25, 145, 110); return &r }(),
+		},
+	}
+
+	colors := []color.RGBA{
+		{R: 37, G: 99, B: 235, A: 255},   // opaque
+		{R: 255, G: 255, B: 255, A: 255}, // opaque white
+		{R: 16, G: 185, B: 129, A: 0},    // zero alpha
+		{R: 239, G: 68, B: 68, A: 128},   // mid alpha
+		{R: 15, G: 23, B: 42, A: 1},      // edge alpha 1
+		{R: 245, G: 158, B: 11, A: 254},  // edge alpha 254
+	}
+
+	for _, cSpec := range canvases {
+		b := cSpec.bounds
+		rects := []struct {
+			name string
+			r    image.Rectangle
+		}{
+			{"single_pixel", image.Rect(b.Min.X+5, b.Min.Y+5, b.Min.X+6, b.Min.Y+6)},
+			{"odd_width_inside", image.Rect(b.Min.X+3, b.Min.Y+4, b.Min.X+36, b.Min.Y+29)},
+			{"clip_left_top", image.Rect(b.Min.X-15, b.Min.Y-10, b.Min.X+30, b.Min.Y+25)},
+			{"clip_right_bottom", image.Rect(b.Max.X-25, b.Max.Y-20, b.Max.X+35, b.Max.Y+15)},
+			{"clip_all_sides", image.Rect(b.Min.X-20, b.Min.Y-20, b.Max.X+20, b.Max.Y+20)},
+			{"completely_outside", image.Rect(b.Max.X+10, b.Max.Y+10, b.Max.X+50, b.Max.Y+50)},
+			{"empty_rect", image.Rect(b.Min.X+10, b.Min.Y+10, b.Min.X+10, b.Min.Y+20)},
+		}
+
+		for _, rSpec := range rects {
+			for _, col := range colors {
+				gotParent := seedPatternCanvas(cSpec.bounds, cSpec.extraStride)
+				wantParent := seedPatternCanvas(cSpec.bounds, cSpec.extraStride)
+
+				gotDst := gotParent
+				wantDst := wantParent
+				targetRect := rSpec.r
+				if cSpec.subRect != nil {
+					gotDst = gotParent.SubImage(*cSpec.subRect).(*image.RGBA)
+					wantDst = wantParent.SubImage(*cSpec.subRect).(*image.RGBA)
+					// Shift test rects around subRect coordinates too
+					subR := rSpec.r.Intersect(*cSpec.subRect)
+					if rSpec.name == "clip_left_top" {
+						targetRect = image.Rect(cSpec.subRect.Min.X-8, cSpec.subRect.Min.Y-6, cSpec.subRect.Min.X+20, cSpec.subRect.Min.Y+15)
+					} else if rSpec.name == "clip_right_bottom" {
+						targetRect = image.Rect(cSpec.subRect.Max.X-15, cSpec.subRect.Max.Y-12, cSpec.subRect.Max.X+12, cSpec.subRect.Max.Y+10)
+					} else if rSpec.name == "completely_outside" {
+						targetRect = image.Rect(cSpec.subRect.Max.X+2, cSpec.subRect.Max.Y+2, cSpec.subRect.Max.X+12, cSpec.subRect.Max.Y+12)
+					} else if !subR.Empty() {
+						targetRect = subR
+					}
+				}
+
+				fillRect(gotDst, targetRect, col)
+				fillRectRef(wantDst, targetRect, col)
+
+				label := cSpec.name + "/" + rSpec.name
+				assertImagesPixelEqual(t, label+" (target)", gotDst, wantDst)
+				// Also verify parent pixels outside subimage remain untouched
+				if cSpec.subRect != nil {
+					assertImagesPixelEqual(t, label+" (parent)", gotParent, wantParent)
+				}
+			}
+		}
+	}
+}
+
+func TestDrawLogoPixelEquivalenceAndConcurrency(t *testing.T) {
+	initUIAssets()
+	if rawLogoImg == nil {
+		t.Fatal("rawLogoImg was not initialized")
+	}
+
+	drawLogoRef := func(dst *image.RGBA, x, y, targetHeight int) {
+		b := rawLogoImg.Bounds()
+		if b.Empty() || targetHeight <= 0 {
+			return
+		}
+		targetWidth := (targetHeight * b.Dx()) / b.Dy()
+		if targetWidth <= 0 {
+			return
+		}
+		dstRect := image.Rect(x, y, x+targetWidth, y+targetHeight)
+		xdraw.BiLinear.Scale(dst, dstRect, rawLogoImg, b, xdraw.Over, nil)
+	}
+
+	cases := []struct {
+		name   string
+		canvas func() (*image.RGBA, *image.RGBA)
+		x, y   int
+		h      int
+	}{
+		{
+			name: "white_header_48",
+			canvas: func() (*image.RGBA, *image.RGBA) {
+				b := image.Rect(0, 0, 600, 120)
+				c := image.NewRGBA(b)
+				fillRect(c, b, colorCardBg)
+				return c, nil
+			},
+			x: 80, y: 31, h: 48,
+		},
+		{
+			name: "clipped_left_top_32",
+			canvas: func() (*image.RGBA, *image.RGBA) {
+				b := image.Rect(0, 0, 300, 80)
+				return seedPatternCanvas(b, 16), nil
+			},
+			x: -25, y: -10, h: 32,
+		},
+		{
+			name: "clipped_right_bottom_40",
+			canvas: func() (*image.RGBA, *image.RGBA) {
+				b := image.Rect(0, 0, 300, 80)
+				return seedPatternCanvas(b, 20), nil
+			},
+			x: 240, y: 55, h: 40,
+		},
+		{
+			name: "completely_outside_48",
+			canvas: func() (*image.RGBA, *image.RGBA) {
+				b := image.Rect(0, 0, 200, 100)
+				return seedPatternCanvas(b, 0), nil
+			},
+			x: 300, y: 200, h: 48,
+		},
+		{
+			name: "nonzero_subimage_stride_64",
+			canvas: func() (*image.RGBA, *image.RGBA) {
+				parent := seedPatternCanvas(image.Rect(0, 0, 420, 200), 32)
+				sub := parent.SubImage(image.Rect(20, 15, 340, 160)).(*image.RGBA)
+				return sub, parent
+			},
+			x: 40, y: 30, h: 64,
+		},
+		{
+			name: "zero_and_negative_height",
+			canvas: func() (*image.RGBA, *image.RGBA) {
+				b := image.Rect(0, 0, 100, 100)
+				return seedPatternCanvas(b, 0), nil
+			},
+			x: 10, y: 10, h: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		gotDst, gotParent := tc.canvas()
+		wantDst, wantParent := tc.canvas()
+
+		drawLogo(gotDst, tc.x, tc.y, tc.h)
+		drawLogoRef(wantDst, tc.x, tc.y, tc.h)
+
+		assertImagesPixelEqual(t, tc.name, gotDst, wantDst)
+		if gotParent != nil && wantParent != nil {
+			assertImagesPixelEqual(t, tc.name+" (parent)", gotParent, wantParent)
+		}
+	}
+
+	// Verify concurrent safety and immutability of cached entries across goroutines
+	const workers = 16
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			h := 48
+			if idx%2 == 1 {
+				h = 36
+			}
+			dst := image.NewRGBA(image.Rect(0, 0, 500, 120))
+			fillRect(dst, dst.Bounds(), colorCardBg)
+			drawLogo(dst, 20, 20, h)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func BenchmarkFillRectOpaque1080p(b *testing.B) {
+	dst := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	rect := dst.Bounds()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fillRect(dst, rect, colorBgSlate)
+	}
+}
+
+func BenchmarkDrawLogo48(b *testing.B) {
+	initUIAssets()
+	dst := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	fillRect(dst, dst.Bounds(), colorCardBg)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		drawLogo(dst, 80, 31, 48)
+	}
+}
+
+func BenchmarkRenderToPINEntry(b *testing.B) {
+	initUIAssets()
+	dst := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	st := ScreenState{
+		Mode:    ModePINEntry,
+		PIN:     "0482",
+		Message: "Enter your 4-digit pickup PIN",
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := RenderTo(dst, st); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRenderToPaymentQR(b *testing.B) {
+	initUIAssets()
+	dst := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	st := ScreenState{
+		Mode:         ModePaymentQR,
+		OrderID:      "ord_bench_001",
+		AmountPaise:  300,
+		PaymentQRURL: "https://rzp.io/i/XG-BENCH-001",
+		Message:      "Scan with any UPI app to pay",
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := RenderTo(dst, st); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
